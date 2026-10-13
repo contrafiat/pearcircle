@@ -40,6 +40,8 @@ const { openSelfCore, openPeerCore, appendFix, readTip, readTipDetailed, readTip
 const Protomux = require('protomux')
 const { signValue, verifyValue, verifyValueWithSigner } = require('./lib/sign')
 const { shouldAcceptSeederRow, buildSeederRevoke, buildSeederAdmission, buildSeederGone, sanitizeSeederNickname } = require('./lib/seederApply')
+const plsClient = require('./peerloom-seeder/client.js')
+const plsRecord = require('./lib/peerloomSeeder')
 const { shouldAcceptSupersede, supersedePendingNext } = require('./lib/supersedeApply')
 const { setupSeederAdmissionChannel } = require('./seederAdmission')
 const { setupSeederSyncChannel } = require('./seederSync')
@@ -829,6 +831,7 @@ const handlers = {
     // while backgrounded is shed before the user looks at the map (proposal
     // 2026-06-01).
     if (_appForeground) probeConnections('foreground')
+    if (_appForeground && _plsPeering) plsPull()
     // Backgrounding is the most likely moment just before the OS kills or the
     // user swipes the app away, so flush the WAL now to keep the next cold
     // start's replay small (store maintenance). Fire-and-forget: never block
@@ -1821,6 +1824,20 @@ const handlers = {
   // Idempotent on already-revoked rows in the sense that re-revoking
   // just bumps updatedAt; harmless. Refuses on absent rows so callers
   // get a clear error rather than a silent no-op.
+  // PeerLoom Seeder (proposals/2026-10-13-peerloom-seeder.md).
+  'pls:list': async () => plsList(),
+  'pls:pair': async ({ link } = {}) => {
+    if (typeof link !== 'string' || !link.trim()) throw new Error('No pairing link')
+    return plsPair(link.trim())
+  },
+  'pls:circle:set': async ({ seederKey, circleId, on } = {}) => {
+    if (typeof seederKey !== 'string' || !/^[0-9a-f]{64}$/.test(seederKey)) throw new Error('seederKey must be 64 hex characters')
+    await plsWriteRow(circleId, seederKey, !!on)
+    return { ok: true }
+  },
+  'pls:forget': async ({ seederKey } = {}) => plsForget(seederKey),
+  'pls:prompt:dismiss': async () => { await _localDb.put(PLS_PROMPT_DISMISSED, { at: Date.now() }); return { ok: true } },
+
   'circle:seeder:revoke': async ({ circleId, pubkey } = {}) => {
     if (!_initialized) throw new Error('worklet not initialized')
     if (typeof circleId !== 'string') throw new Error('circleId must be a string')
@@ -5082,6 +5099,31 @@ async function applyCircleNodes (nodes, view, base, circleId) {
         if (accepted) await view.put(op.key, incoming)
         continue
       }
+      // `pseeder:{seederKey}` (proposals/2026-10-13-peerloom-seeder.md): a
+      // PeerLoom Seeder. Signed by `writer`; any current member may add one,
+      // and only the owner, a current co-owner or whoever added it may change
+      // it afterwards. See src/lib/peerloomSeeder.js.
+      if (op.key.startsWith(plsRecord.PREFIX)) {
+        const incoming = op.value
+        if (!incoming || typeof incoming.writer !== 'string') continue
+        const writerMember = (await view.get('member:' + incoming.writer))?.value
+        const writerRemovedTs = (await view.get('removed:' + incoming.writer))?.value?.ts
+        const writerLeftTs = (await view.get('left:' + incoming.writer))?.value?.leftAt
+        const accept = plsRecord.acceptRecord({
+          key: op.key,
+          incoming,
+          existing: (await view.get(op.key))?.value || null,
+          writerMember,
+          writerRemoved: memberHiddenByRemoved(writerRemovedTs, writerMember?.joinedAt) || memberHiddenByLeft(writerLeftTs, writerMember?.joinedAt),
+          ownerKey: (await view.get('circle'))?.value?.ownerKey,
+          coowners: await readCoowners(view),
+          now: Date.now(),
+          futureToleranceMs: FUTURE_TS_TOLERANCE_MS,
+          verifySig: (val) => verifyValueWithSigner(val, 'writer'),
+        })
+        if (accept) await view.put(op.key, incoming)
+        continue
+      }
       // Other prefixes not yet wired — silently dropped.
     }
   }
@@ -6575,6 +6617,291 @@ async function isKnownInviter (pubkeyHex) {
   return false
 }
 
+// ── PeerLoom Seeder (proposals/2026-10-13-peerloom-seeder.md) ────────────────
+// The shared seeder for every PeerLoom app. A member pairs this device with one
+// from the link its dashboard shows, then adds it to circles with a signed
+// `pseeder:{seederKey}` row (src/lib/peerloomSeeder.js). Every member registers
+// each circle with every seeder its rows name, through blind-peering, which
+// follows new writers itself. Ported from PearCal (pearcal-native #340). The
+// seeder never gets the circle key or the encryption key.
+//
+// Seeder traffic dials with its own fixed key (`plsSeed` in the local db), not
+// the identity: pairing runs on a short-lived swarm, which must not announce
+// the main swarm's key, and the seeder need not learn the identity members see.
+const PLS_LOCAL = 'plSeeder:'
+const PLS_PROMPT_DISMISSED = 'plSeederPromptDismissed'
+const PLS_SWEEP_MS = 5000
+// blind-peering drops its connection to a seeder a few seconds after it last
+// uploaded something, so a member that stays open learns nothing more from it.
+// A pull visits each seeder the circles use, replicates for a while and leaves:
+// at start, after registration changes, on foreground and once a minute while
+// in the foreground.
+const PLS_PULL_MS = 60 * 1000
+const PLS_PULL_HOLD_MS = 15 * 1000
+// The seeder keeps blocks it received in the last 90 days of each circle: the
+// longest any circle history is kept (place arrivals, TRANSITION_RETENTION_MS).
+const PLS_RETAIN_DAYS = 90
+let _plsKeyPair = null
+let _plsPeering = null
+let _plsTimer = null
+let _plsPullTimer = null
+let _plsSweeping = null
+let _plsAgain = null
+let _plsPulling = null
+const _plsRegistered = new Map() // circleId -> base key + sorted seeder keys
+const _plsRetained = new Set() // seederKey + ':' + base key, retain sent this run
+
+async function plsKeyPair () {
+  if (_plsKeyPair) return _plsKeyPair
+  let seed = (await _localDb.get('plsSeed').catch(() => null))?.value?.seed
+  if (!seed) {
+    seed = b4a.toString(require('hypercore-crypto').randomBytes(32), 'hex')
+    await _localDb.put('plsSeed', { seed })
+  }
+  _plsKeyPair = require('hypercore-crypto').keyPair(b4a.from(seed, 'hex'))
+  return _plsKeyPair
+}
+
+// The non-revoked seeders a circle's rows name.
+async function plsSeedersOf (base) {
+  const out = []
+  if (!base?.view) return out
+  try {
+    for await (const { key, value } of base.view.createReadStream({ gt: plsRecord.PREFIX, lt: plsRecord.PREFIX + '~' })) {
+      const k = plsRecord.parseRecordKey(key)
+      if (k && value && !value.revoked) out.push(k)
+    }
+  } catch {}
+  return out.sort()
+}
+
+async function plsMakePeering () {
+  _plsPeering = plsClient.createPeering({ dht: _swarm.dht, store: _store, keyPair: await plsKeyPair() })
+}
+
+async function plsSweepAll () {
+  if (!_plsPeering || !_swarm) return
+  let removed = false
+  const wanted = new Map()
+  for (const [circleId, base] of _circleBases) {
+    const keys = await plsSeedersOf(base)
+    const id = keys.length ? b4a.toString(base.key, 'hex') + '|' + keys.join(',') : ''
+    wanted.set(circleId, { keys, id })
+    const prev = _plsRegistered.get(circleId)
+    if (prev) {
+      const [prevBase, prevKeys] = prev.split('|')
+      // A repaired circle mounts a new base; a revoked seeder leaves the list.
+      if (prevBase !== b4a.toString(base.key, 'hex') || prevKeys.split(',').some((k) => !keys.includes(k))) removed = true
+    }
+  }
+  for (const circleId of _plsRegistered.keys()) if (!_circleBases.has(circleId)) removed = true
+  if (removed) {
+    // blind-peering cannot forget one base, so start over.
+    const old = _plsPeering
+    await plsMakePeering()
+    _plsRegistered.clear()
+    await old.close().catch(() => {})
+  }
+  for (const [circleId, { keys, id }] of wanted) {
+    if (!keys.length || _plsRegistered.get(circleId) === id) continue
+    const base = _circleBases.get(circleId)
+    if (!base) continue
+    try { await base.ready() } catch { continue }
+    _plsRegistered.set(circleId, id)
+    _plsPeering.addAutobaseBackground(base, { keys: keys.map((k) => b4a.from(k, 'hex')), pick: keys.length })
+    mark('pls:registered', { circle: circleId.slice(0, 8), seeders: keys.length })
+    plsPull()
+  }
+}
+
+// Ask each seeder this phone paired with to keep only the last
+// PLS_RETAIN_DAYS of each circle (the seeder takes it only from paired
+// devices). It answers only once it has this device's registration, so this
+// runs after a pull and retries on the next one until it is accepted.
+async function plsRetainAll (bySeeder) {
+  const keyPair = await plsKeyPair()
+  const asker = plsClient.createAsker({ dht: () => _swarm.dht, keyPair })
+  for (const [seederKey, list] of bySeeder) {
+    if (!(await _localDb.get(PLS_LOCAL + seederKey).catch(() => null))?.value) continue
+    for (const base of list) {
+      const space = b4a.toString(base.key, 'hex')
+      const id = seederKey + ':' + space
+      if (_plsRetained.has(id)) continue
+      try {
+        await asker.ask(seederKey, { t: 'retain', bootstrap: space, days: PLS_RETAIN_DAYS })
+        _plsRetained.add(id)
+        mark('pls:retain', { seeder: seederKey.slice(0, 8), days: PLS_RETAIN_DAYS })
+      } catch (e) { mark('pls:retain-failed', { seeder: seederKey.slice(0, 8), error: e?.message }) }
+    }
+  }
+}
+
+async function plsPullAll () {
+  if (!_swarm) return
+  const bySeeder = new Map()
+  for (const [, base] of _circleBases) {
+    for (const k of await plsSeedersOf(base)) {
+      if (!bySeeder.has(k)) bySeeder.set(k, [])
+      bySeeder.get(k).push(base)
+    }
+  }
+  if (!bySeeder.size) return
+  const keyPair = await plsKeyPair()
+  await Promise.all([...bySeeder].map(async ([seederKey, list]) => {
+    const conn = _swarm.dht.connect(b4a.from(seederKey, 'hex'), { keyPair })
+    conn.on('error', () => {})
+    _store.replicate(conn)
+    const opened = await new Promise((resolve) => {
+      const t = setTimeout(() => resolve(false), PLS_PULL_HOLD_MS)
+      conn.once('open', () => { clearTimeout(t); resolve(true) })
+      conn.once('close', () => { clearTimeout(t); resolve(false) })
+    })
+    const end = Date.now() + PLS_PULL_HOLD_MS
+    while (opened && Date.now() < end && !conn.destroyed) {
+      for (const base of list) {
+        try {
+          for (const w of (base.activeWriters || [])) if (w?.core?.update) await w.core.update().catch(() => {})
+          await base.update()
+        } catch {}
+      }
+      await new Promise((r) => setTimeout(r, 1000))
+    }
+    conn.destroy()
+  }))
+  await plsRetainAll(bySeeder)
+}
+
+function plsPull () {
+  if (_plsPulling) return _plsPulling
+  _plsPulling = plsPullAll().catch((e) => console.warn('[pls] pull failed:', e?.message)).finally(() => { _plsPulling = null })
+  return _plsPulling
+}
+
+function plsSweep () {
+  if (!_plsSweeping) {
+    _plsSweeping = plsSweepAll().catch((e) => console.warn('[pls] sweep failed:', e?.message)).finally(() => { _plsSweeping = null })
+    return _plsSweeping
+  }
+  if (!_plsAgain) _plsAgain = _plsSweeping.then(() => { _plsAgain = null; return plsSweep() })
+  return _plsAgain
+}
+
+function startPeerloomSeeding () {
+  if (_plsTimer || !_swarm) return
+  plsMakePeering().then(() => {
+    _plsTimer = setInterval(() => plsSweep(), PLS_SWEEP_MS)
+    _plsPullTimer = setInterval(() => { if (_appForeground) plsPull() }, PLS_PULL_MS)
+    plsSweep()
+  }).catch((e) => console.warn('[pls] start failed:', e?.message))
+}
+
+async function plsCircleAuth (base) {
+  const circle = (await base.view.get('circle').catch(() => null))?.value || null
+  return { circle, ownerKey: circle?.ownerKey || null, coowners: await readCoowners(base.view) }
+}
+
+// Add (on) or revoke (off) a seeder in one circle. Throws when this device may
+// not change that row.
+async function plsWriteRow (circleId, seederKey, on) {
+  const base = _circleBases.get(circleId)
+  if (!base) throw new Error('unknown circle: ' + circleId)
+  if (!base.writable) throw new Error('This phone cannot write to that circle yet')
+  const me = b4a.toString(_identity.publicKey, 'hex')
+  const existing = (await base.view.get(plsRecord.recordKey(seederKey)).catch(() => null))?.value || null
+  const { ownerKey, coowners } = await plsCircleAuth(base)
+  if (!plsRecord.canChange({ me, existing, ownerKey, coowners })) throw new Error('Only the circle owner, a co-owner or whoever added this seeder can change it')
+  if (!existing && !on) return
+  if (existing && !!existing.revoked === !on) return
+  const row = plsRecord.buildRecord({ seederKey, writer: me, existing, revoked: !on })
+  await base.append({ type: 'put', key: plsRecord.recordKey(seederKey), value: signValue(row, _identity.secretKey) })
+  plsSweep()
+}
+
+async function plsPair (link) {
+  const keyPair = await plsKeyPair()
+  // A short-lived swarm with the fixed key, so the seeder trusts that key.
+  const temp = new Hyperswarm({ keyPair })
+  try {
+    const { seederKey, style } = await plsClient.pair({ swarm: temp, link, app: 'PearCircle' })
+    await _localDb.put(PLS_LOCAL + seederKey, { seederKey, style, pairedAt: Date.now() })
+    // Back up every circle this phone is in; the person can untick them.
+    const added = []
+    for (const circleId of _circleBases.keys()) {
+      try { await plsWriteRow(circleId, seederKey, true); added.push(circleId) } catch (e) { console.warn('[pls] add to circle failed:', e?.message) }
+    }
+    mark('pls:paired', { seeder: seederKey.slice(0, 8), circles: added.length })
+    return { seederKey, circles: added.length }
+  } finally {
+    await temp.destroy().catch(() => {})
+  }
+}
+
+// Seeders this phone paired with plus any a circle names, each with its
+// circles, and whether to show the "replaces the PearCircle seeder" prompt.
+async function plsList () {
+  const me = b4a.toString(_identity.publicKey, 'hex')
+  const seeders = new Map()
+  const entry = (k) => { if (!seeders.has(k)) seeders.set(k, { seederKey: k, paired: false, pairedAt: null, circles: [] }); return seeders.get(k) }
+  for await (const { value } of _localDb.createReadStream({ gt: PLS_LOCAL, lt: PLS_LOCAL + '~' })) {
+    if (value?.seederKey) Object.assign(entry(value.seederKey), { paired: true, pairedAt: value.pairedAt })
+  }
+  const perCircle = []
+  let oldSeeders = 0
+  for (const [circleId, base] of _circleBases) {
+    const rows = new Map()
+    try {
+      for await (const { key, value } of base.view.createReadStream({ gt: plsRecord.PREFIX, lt: plsRecord.PREFIX + '~' })) {
+        const k = plsRecord.parseRecordKey(key)
+        if (k) { rows.set(k, value); entry(k) }
+      }
+      for await (const { value } of base.view.createReadStream({ gt: 'seeder:', lt: 'seeder:~' })) {
+        if (value && !value.revoked && !value.left) oldSeeders++
+      }
+    } catch {}
+    const auth = await plsCircleAuth(base)
+    const names = new Map()
+    try {
+      for await (const { key, value } of base.view.createReadStream({ gt: 'member:', lt: 'member:~' })) names.set(key.slice('member:'.length), value?.displayName)
+    } catch {}
+    perCircle.push({ circleId, rows, auth, names })
+  }
+  for (const s of seeders.values()) {
+    for (const { circleId, rows, auth, names } of perCircle) {
+      if (auth.circle?.deleted) continue
+      const row = rows.get(s.seederKey) || null
+      s.circles.push({
+        circleId,
+        name: auth.circle?.name || 'Circle',
+        on: !!row && !row.revoked,
+        addedBy: row?.addedBy || null,
+        addedByName: row?.addedBy === me ? 'you' : (names.get(row?.addedBy) || null),
+        canChange: plsRecord.canChange({ me, existing: row, ownerKey: auth.ownerKey, coowners: auth.coowners }),
+      })
+    }
+  }
+  const dismissed = !!(await _localDb.get(PLS_PROMPT_DISMISSED).catch(() => null))?.value
+  return { seeders: [...seeders.values()], showPrompt: oldSeeders > 0 && seeders.size === 0 && !dismissed }
+}
+
+// Stop using a seeder from this phone: take it off the circles this phone may
+// change, ask it to drop them (after its 7-day grace, unless someone else
+// still backs them up there) and forget the pairing.
+async function plsForget (seederKey) {
+  const keyPair = await plsKeyPair()
+  const asker = plsClient.createAsker({ dht: () => _swarm.dht, keyPair })
+  const me = b4a.toString(_identity.publicKey, 'hex')
+  for (const [circleId, base] of _circleBases) {
+    const row = (await base.view.get(plsRecord.recordKey(seederKey)).catch(() => null))?.value
+    if (!row || row.revoked) continue
+    const { ownerKey, coowners } = await plsCircleAuth(base)
+    if (plsRecord.canChange({ me, existing: row, ownerKey, coowners })) await plsWriteRow(circleId, seederKey, false).catch(() => {})
+    await asker.ask(seederKey, { t: 'drop', bootstrap: b4a.toString(base.key, 'hex') }).catch(() => {})
+  }
+  await _localDb.del(PLS_LOCAL + seederKey)
+  plsSweep()
+  return { ok: true }
+}
+
 // Write a signed seeder:{pubkey} admission row. Extracted from the
 // circle:seeder:approve IPC so the auto-approve path (followed seeders)
 // can reuse it. Proposal 2026-05-19 slice 3d + 2026-05-20 amendment.
@@ -7992,6 +8319,8 @@ async function init ({ dataDir, mode, version } = {}, attempt = 0) {
   _activeHandlers = handlers
   _initialized = true
   mark('init:done', { circles: _circleBases.size })
+
+  startPeerloomSeeding()
 
   // The boot grace suppresses the idle demotion, it does not schedule the
   // step-down that has to follow it. The driver only runs on its event inputs,

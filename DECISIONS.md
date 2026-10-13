@@ -2,6 +2,18 @@
 
 Per-app decision log for PearCircle. Append-only, newest on top. See `/home/tim/peerloomllc/CONSTITUTION.md` §4 for the entry format.
 
+## 2026-10-13 - PeerLoom Seeder: signed `pseeder:` rows, its own dial key, a 90-day keep
+
+Tier: T3. Proposal `proposals/2026-10-13-peerloom-seeder.md` (approved, PR #242).
+
+Context: circles can now back up to PeerLoom Seeder, the shared seeder for every PeerLoom app. Building it settled four things the proposal left open.
+
+Choice: (1) `pseeder:{seederKey}` rows are signed by the identity key and checked in `src/lib/peerloomSeeder.js`: any current member may add one (and becomes `addedBy`); a later row needs the owner, a current co-owner or `addedBy`, who must not be removed or have left. (2) Seeder traffic dials with its own fixed key (`plsSeed` in the local db) on a short-lived swarm for pairing, so the main swarm's identity key is never announced twice and the seeder does not learn the key members know each other by. (3) Each phone that paired a seeder asks it to keep the last 90 days of each circle (the longest history the app keeps, place arrivals). Unpaired members back the circle up but may not send the request. (4) Pull visits as in PearCal, but the once-a-minute visit runs only in the foreground; a background worklet still uploads through its registration.
+
+Alternatives considered: blind-peering with its current blind-peer-muxer (1.7) - rejected, it pulls hyperschema 1.26 with compact-encoding 3, and hypercore-storage then crashed on start opening an existing circle (`preencode` on null in `CoreTX.setHead`). Pinned `blind-peer-muxer` 1.1.1 in `overrides`, PearCal's version; nothing else in the lockfile moves. Dialling with the identity key - rejected for (2).
+
+Consequences: verified on the emulator + TCL with a local PeerLoom Seeder: pairing labelled "PearCircle" on the dashboard, the emulator caught up a new place from the seeder alone 15 s after opening with the TCL closed, the seeder accepted the 90-day request, no circle or member names in its files, the adder's removal reached the owner's phone, the switch is disabled for a member who is neither owner nor adder, and a member on the master build kept syncing live with no errors. The old `seeder:` path is untouched.
+
 ## 2026-09-30 - Android adaptive location: low power while idle, GPS while moving
 
 Tier: T1. Proposal `proposals/2026-09-30-android-adaptive-location.md` (PR #225).
