@@ -1563,6 +1563,13 @@ const SEEDER_PAIR_SCAN_SECONDS = 60
 // for every PeerLoom app. Pair by scanning or pasting the link its dashboard
 // shows; each circle then backs up to it. Only the circle owner, a co-owner or
 // whoever added it can take it off a circle.
+// pear.call never rejects: a handler error comes back as { ok: false, error }.
+async function plsCall (method, args) {
+  const r = await pear.call(method, args)
+  if (r && r.ok === false && r.error) throw new Error(r.error)
+  return r
+}
+
 function PeerloomSeederSection ({ active = true }) {
   const [seeders, setSeeders] = useState([])
   const [showPrompt, setShowPrompt] = useState(false)
@@ -1572,7 +1579,7 @@ function PeerloomSeederSection ({ active = true }) {
 
   const refresh = useCallback(async () => {
     try {
-      const r = await pear.call('pls:list')
+      const r = await plsCall('pls:list')
       setSeeders(r?.seeders ?? [])
       setShowPrompt(!!r?.showPrompt)
     } catch {}
@@ -1591,7 +1598,7 @@ function PeerloomSeederSection ({ active = true }) {
     if (!clean) return
     setBusy(true); setMsg('Pairing...')
     try {
-      const r = await pear.call('pls:pair', { link: clean })
+      const r = await plsCall('pls:pair', { link: clean })
       setLink('')
       setMsg(`Paired. ${r?.circles ?? 0} ${r?.circles === 1 ? 'circle is' : 'circles are'} backing up to it.`)
     } catch (e) { setMsg(String(e?.message ?? e)) }
@@ -1605,19 +1612,19 @@ function PeerloomSeederSection ({ active = true }) {
   }
 
   const setCircle = async (seederKey, circleId, on) => {
-    try { await pear.call('pls:circle:set', { seederKey, circleId, on }) } catch (e) { setMsg(String(e?.message ?? e)) }
+    try { await plsCall('pls:circle:set', { seederKey, circleId, on }) } catch (e) { setMsg(String(e?.message ?? e)) }
     refresh()
   }
 
   const forget = async (seederKey) => {
     haptic('medium')
-    try { await pear.call('pls:forget', { seederKey }) } catch (e) { setMsg(String(e?.message ?? e)) }
+    try { await plsCall('pls:forget', { seederKey }) } catch (e) { setMsg(String(e?.message ?? e)) }
     refresh()
   }
 
   const dismissPrompt = async () => {
     setShowPrompt(false)
-    try { await pear.call('pls:prompt:dismiss') } catch {}
+    try { await plsCall('pls:prompt:dismiss') } catch {}
   }
 
   return (
