@@ -47,3 +47,36 @@ describe('the baked relay key', () => {
     expect(RELAY_PUBLIC_KEY_Z).toBe('qshao3eawtzecrt5p7buswr4meyyhw6q6b51qtxazd8wwfdp8uqy')
   })
 })
+
+// PeerLoom Seeder dials (blind-peering, pulls, requests): direct first, then
+// through the relay after a failed holepunch to that key.
+describe('relayingDht', () => {
+  const { relayingDht } = require('../src/lib/relay')
+  const EventEmitter = require('events')
+  const KEY = Buffer.alloc(32, 7)
+  const RELAY = Buffer.alloc(32, 9)
+  function fakeDht () {
+    const calls = []
+    return { calls, randomized: false, other () { return 'kept' }, connect (key, opts) { const s = new EventEmitter(); calls.push({ key, opts, s }); return s } }
+  }
+  test('direct first, relay after a failed punch, per key', () => {
+    const d = fakeDht()
+    const w = relayingDht(d, { useRelay: () => true, relayKey: RELAY })
+    w.connect(KEY, { keyPair: 'kp' })
+    expect(d.calls[0].opts).toEqual({ keyPair: 'kp' })
+    d.calls[0].s.emit('error', Object.assign(new Error('x'), { code: 'HOLEPUNCH_ABORTED' }))
+    w.connect(KEY, { keyPair: 'kp' })
+    expect(d.calls[1].opts).toEqual({ keyPair: 'kp', relayThrough: RELAY })
+    w.connect(Buffer.alloc(32, 1), {})
+    expect(d.calls[2].opts).toEqual({})
+    expect(w.other()).toBe('kept')
+  })
+  test('the toggle off never relays', () => {
+    const d = fakeDht()
+    const w = relayingDht(d, { useRelay: () => false, relayKey: RELAY })
+    w.connect(KEY, {})
+    d.calls[0].s.emit('error', Object.assign(new Error('x'), { code: 'HOLEPUNCH_ABORTED' }))
+    w.connect(KEY, {})
+    expect(d.calls[1].opts).toEqual({})
+  })
+})

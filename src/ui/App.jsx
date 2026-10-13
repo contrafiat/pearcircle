@@ -6063,8 +6063,10 @@ function ProfileView ({ active = true, profile, sharing, setSharingForCircle, ti
       )}
 
       {/* Seeders & relay: the two optional ways phones reach each other
-          besides a direct connection. */}
-      <Collapsible title='Seeders & relay' icon={HardDrives} open={openSection === 'seeders'} onToggle={() => toggleSection('seeders')} maxHeight='2000px'>
+          besides a direct connection. Tall, because the PeerLoom Seeder list
+          grows with every seeder and circle, and a clipped list hid the relay
+          switch below it. */}
+      <Collapsible title='Seeders & relay' icon={HardDrives} open={openSection === 'seeders'} onToggle={() => toggleSection('seeders')} maxHeight='8000px'>
         <PeerloomSeederSection active={active && openSection === 'seeders'} />
         <SeedersSection active={active && openSection === 'seeders'} />
         {/* Renders nothing (heading included) on a build with no relay key. */}
