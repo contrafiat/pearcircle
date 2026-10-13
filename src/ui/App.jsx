@@ -1559,6 +1559,133 @@ function ToggleSwitch ({ on, onChange, disabled = false }) {
 // Kept in step with SEEDER_PAIR_SCAN_TIMEOUT_MS in src/bare.js (60s).
 const SEEDER_PAIR_SCAN_SECONDS = 60
 
+// PeerLoom Seeder (proposals/2026-10-13-peerloom-seeder.md): the shared seeder
+// for every PeerLoom app. Pair by scanning or pasting the link its dashboard
+// shows; each circle then backs up to it. Only the circle owner, a co-owner or
+// whoever added it can take it off a circle.
+function PeerloomSeederSection ({ active = true }) {
+  const [seeders, setSeeders] = useState([])
+  const [showPrompt, setShowPrompt] = useState(false)
+  const [link, setLink] = useState('')
+  const [busy, setBusy] = useState(false)
+  const [msg, setMsg] = useState(null)
+
+  const refresh = useCallback(async () => {
+    try {
+      const r = await pear.call('pls:list')
+      setSeeders(r?.seeders ?? [])
+      setShowPrompt(!!r?.showPrompt)
+    } catch {}
+  }, [])
+
+  useEffect(() => {
+    if (!active) return
+    refresh()
+    const id = setInterval(refresh, 5000)
+    return () => clearInterval(id)
+  }, [active, refresh])
+
+  const pairWith = async (text) => {
+    // Phone keyboards capitalise the first letter of a typed link.
+    const clean = String(text || '').trim().replace(/^[a-z]+:/i, (m) => m.toLowerCase())
+    if (!clean) return
+    setBusy(true); setMsg('Pairing...')
+    try {
+      const r = await pear.call('pls:pair', { link: clean })
+      setLink('')
+      setMsg(`Paired. ${r?.circles ?? 0} ${r?.circles === 1 ? 'circle is' : 'circles are'} backing up to it.`)
+    } catch (e) { setMsg(String(e?.message ?? e)) }
+    setBusy(false); refresh()
+  }
+
+  const scan = async () => {
+    let text
+    try { text = await pear.call('shell:scanQr') } catch (e) { setMsg('Scan failed: ' + (e?.message ?? e)); return }
+    if (typeof text === 'string' && text.trim()) pairWith(text)
+  }
+
+  const setCircle = async (seederKey, circleId, on) => {
+    try { await pear.call('pls:circle:set', { seederKey, circleId, on }) } catch (e) { setMsg(String(e?.message ?? e)) }
+    refresh()
+  }
+
+  const forget = async (seederKey) => {
+    haptic('medium')
+    try { await pear.call('pls:forget', { seederKey }) } catch (e) { setMsg(String(e?.message ?? e)) }
+    refresh()
+  }
+
+  const dismissPrompt = async () => {
+    setShowPrompt(false)
+    try { await pear.call('pls:prompt:dismiss') } catch {}
+  }
+
+  return (
+    <div style={{ marginBottom: spacing.xl }}>
+      <p style={{ ...s.muted, color: colors.text.primary, fontWeight: 600, marginBottom: spacing.xs }}>PeerLoom Seeder</p>
+      <p style={{ ...s.muted, marginTop: 0 }}>
+        Keeps your circles in sync while your phones sleep. It serves all your PeerLoom apps,
+        stores your circles scrambled and cannot read them. A new member still needs someone
+        in the circle online to join.
+      </p>
+      {showPrompt && (
+        <div data-testid='pls-prompt' style={{ ...s.section }}>
+          <p style={{ margin: 0, color: colors.text.primary, fontSize: typography.body.fontSize }}>
+            PeerLoom Seeder replaces the PearCircle seeder and serves all your PeerLoom apps.
+            Set it up, then pair this phone. Your PearCircle seeder keeps working until you remove it.
+          </p>
+          <div style={{ display: 'flex', gap: spacing.sm, marginTop: spacing.sm }}>
+            <button onClick={() => { dismissPrompt(); scan() }} style={{ ...s.primaryBtn, flex: 1 }}>Set up</button>
+            <button onClick={dismissPrompt} style={{ ...s.secondaryBtn, flex: 1, marginTop: 0 }}>Not now</button>
+          </div>
+        </div>
+      )}
+      {seeders.map((sd) => (
+        <div key={sd.seederKey} style={{ ...s.section }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: spacing.sm }}>
+            <span style={{ flex: 1, minWidth: 0, ...s.idMuted, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+              {sd.seederKey.slice(0, 16)}...
+            </span>
+            {sd.paired && (
+              <button onClick={() => forget(sd.seederKey)}
+                style={{ padding: `${spacing.xs}px ${spacing.sm}px`, fontSize: typography.caption.fontSize, borderRadius: radius.md,
+                  cursor: 'pointer', border: `1px solid ${colors.error}`, background: 'transparent', color: colors.error }}>
+                Stop using
+              </button>
+            )}
+          </div>
+          {sd.circles.map((c) => (
+            <div key={c.circleId} style={{ display: 'flex', alignItems: 'center', gap: spacing.md, marginTop: spacing.sm, opacity: c.canChange ? 1 : 0.6 }}>
+              <div style={{ flex: 1, minWidth: 0 }}>
+                <div style={{ color: colors.text.primary, fontSize: typography.body.fontSize }}>{c.name}</div>
+                {c.on && !c.canChange && (
+                  <div style={{ ...typography.caption, color: colors.text.muted }}>
+                    Added by {c.addedByName || 'a member'}. Only they, the circle owner or a co-owner can remove it.
+                  </div>
+                )}
+              </div>
+              <ToggleSwitch on={c.on} disabled={!c.canChange} onChange={(v) => setCircle(sd.seederKey, c.circleId, v)} />
+            </div>
+          ))}
+        </div>
+      ))}
+      <button onClick={scan} disabled={busy} style={s.primaryBtn}>{busy ? 'Pairing...' : 'Scan PeerLoom Seeder QR'}</button>
+      <div style={{ display: 'flex', gap: spacing.sm, marginTop: spacing.sm }}>
+        <input value={link} onChange={(e) => setLink(e.target.value)} placeholder='or paste peerloom://seeder?...'
+          aria-label='PeerLoom Seeder pairing link' autoCapitalize='none' autoCorrect='off' spellCheck={false}
+          style={{ flex: 1, minWidth: 0, padding: spacing.sm, fontSize: typography.caption.fontSize, borderRadius: radius.md,
+            border: `1px solid ${colors.text.muted}`, background: colors.surface.input, color: colors.text.primary }} />
+        <button onClick={() => pairWith(link)} disabled={busy || !link.trim()}
+          style={{ padding: `${spacing.sm}px ${spacing.md}px`, borderRadius: radius.md, cursor: 'pointer',
+            border: `1px solid ${colors.primary}`, background: 'transparent', color: colors.primary, opacity: busy || !link.trim() ? 0.5 : 1 }}>
+          Pair
+        </button>
+      </div>
+      {msg && <p style={{ ...s.muted, marginBottom: 0 }}>{msg}</p>}
+    </div>
+  )
+}
+
 // Top-level seeder management. Proposal amendment 2026-05-19 (global
 // seeder setup): one section, not a per-circle thing. "Set up a seeder
 // device" mints seed invites for every encrypted circle at once (no
@@ -5931,6 +6058,7 @@ function ProfileView ({ active = true, profile, sharing, setSharingForCircle, ti
       {/* Seeders & relay: the two optional ways phones reach each other
           besides a direct connection. */}
       <Collapsible title='Seeders & relay' icon={HardDrives} open={openSection === 'seeders'} onToggle={() => toggleSection('seeders')} maxHeight='2000px'>
+        <PeerloomSeederSection active={active && openSection === 'seeders'} />
         <SeedersSection active={active && openSection === 'seeders'} />
         {/* Renders nothing (heading included) on a build with no relay key. */}
         <div style={{ marginTop: spacing.xl }}>
