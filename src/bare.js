@@ -86,7 +86,7 @@ const { nextEmittedMode, MODE_BOOT_GRACE_MS } = require('./lib/locationMode')
 const { padTripStartTs, tripApplyDecision, shouldReplicateTrip, mergeTripStreams } = require('./lib/tripWire')
 const { TRIP_RETENTION_MS, MAX_TRIPS_PER_MEMBER, tripIsExpired } = require('./lib/tripRetention')
 const { TRANSITION_RETENTION_MS, transitionIsExpired } = require('./lib/transitionRetention')
-const { RELAY_PUBLIC_KEY, relayThroughFor } = require('./lib/relay')
+const { RELAY_PUBLIC_KEY, relayThroughFor, relayingDht } = require('./lib/relay')
 
 // Reject values stamped more than 5 minutes in the future against the local
 // clock (proposal §5). Catches replay/forgery and clock skew on the writer.
@@ -6675,8 +6675,20 @@ async function plsSeedersOf (base) {
   return out.sort()
 }
 
+// The swarm's DHT, direct first and through the relay after a failed
+// holepunch to that seeder (a Start9 on the same network needs the relay).
+let _plsDht = null
+let _plsDhtBase = null
+function plsDht () {
+  if (!_plsDht || _plsDhtBase !== _swarm.dht) {
+    _plsDhtBase = _swarm.dht
+    _plsDht = relayingDht(_swarm.dht, { useRelay: () => _useRelay, relayKey: RELAY_PUBLIC_KEY })
+  }
+  return _plsDht
+}
+
 async function plsMakePeering () {
-  _plsPeering = plsClient.createPeering({ dht: _swarm.dht, store: _store, keyPair: await plsKeyPair() })
+  _plsPeering = plsClient.createPeering({ dht: plsDht(), store: _store, keyPair: await plsKeyPair() })
 }
 
 async function plsSweepAll () {
@@ -6720,9 +6732,10 @@ async function plsSweepAll () {
 // runs after a pull and retries on the next one until it is accepted.
 async function plsRetainAll (bySeeder) {
   const keyPair = await plsKeyPair()
-  const asker = plsClient.createAsker({ dht: () => _swarm.dht, keyPair })
-  for (const [seederKey, list] of bySeeder) {
-    if (!(await _localDb.get(PLS_LOCAL + seederKey).catch(() => null))?.value) continue
+  const asker = plsClient.createAsker({ dht: () => plsDht(), keyPair })
+  // In parallel: one unreachable seeder must not hold up the others.
+  await Promise.all([...bySeeder].map(async ([seederKey, list]) => {
+    if (!(await _localDb.get(PLS_LOCAL + seederKey).catch(() => null))?.value) return
     for (const base of list) {
       const space = b4a.toString(base.key, 'hex')
       const id = seederKey + ':' + space
@@ -6733,7 +6746,7 @@ async function plsRetainAll (bySeeder) {
         mark('pls:retain', { seeder: seederKey.slice(0, 8), days: PLS_RETAIN_DAYS })
       } catch (e) { mark('pls:retain-failed', { seeder: seederKey.slice(0, 8), error: e?.message }) }
     }
-  }
+  }))
 }
 
 async function plsPullAll () {
@@ -6747,8 +6760,9 @@ async function plsPullAll () {
   }
   if (!bySeeder.size) return
   const keyPair = await plsKeyPair()
+  const reached = new Map()
   await Promise.all([...bySeeder].map(async ([seederKey, list]) => {
-    const conn = _swarm.dht.connect(b4a.from(seederKey, 'hex'), { keyPair })
+    const conn = plsDht().connect(b4a.from(seederKey, 'hex'), { keyPair })
     conn.on('error', () => {})
     _store.replicate(conn)
     const opened = await new Promise((resolve) => {
@@ -6756,6 +6770,7 @@ async function plsPullAll () {
       conn.once('open', () => { clearTimeout(t); resolve(true) })
       conn.once('close', () => { clearTimeout(t); resolve(false) })
     })
+    if (opened) reached.set(seederKey, list)
     const end = Date.now() + PLS_PULL_HOLD_MS
     while (opened && Date.now() < end && !conn.destroyed) {
       for (const base of list) {
@@ -6768,7 +6783,8 @@ async function plsPullAll () {
     }
     conn.destroy()
   }))
-  await plsRetainAll(bySeeder)
+  // Only seeders this visit reached; an unreachable one would cost timeouts.
+  await plsRetainAll(reached)
 }
 
 function plsPull () {
@@ -6820,7 +6836,10 @@ async function plsWriteRow (circleId, seederKey, on) {
 async function plsPair (link) {
   const keyPair = await plsKeyPair()
   // A short-lived swarm with the fixed key, so the seeder trusts that key.
-  const temp = new Hyperswarm({ keyPair })
+  const temp = new Hyperswarm({
+    keyPair,
+    relayThrough: (force, s) => relayThroughFor({ force, randomized: s?.dht?.randomized, useRelay: _useRelay, relayKey: RELAY_PUBLIC_KEY }),
+  })
   try {
     const { seederKey, style } = await plsClient.pair({ swarm: temp, link, app: 'PearCircle' })
     await _localDb.put(PLS_LOCAL + seederKey, { seederKey, style, pairedAt: Date.now() })
@@ -6888,7 +6907,7 @@ async function plsList () {
 // still backs them up there) and forget the pairing.
 async function plsForget (seederKey) {
   const keyPair = await plsKeyPair()
-  const asker = plsClient.createAsker({ dht: () => _swarm.dht, keyPair })
+  const asker = plsClient.createAsker({ dht: () => plsDht(), keyPair })
   const me = b4a.toString(_identity.publicKey, 'hex')
   for (const [circleId, base] of _circleBases) {
     const row = (await base.view.get(plsRecord.recordKey(seederKey)).catch(() => null))?.value
