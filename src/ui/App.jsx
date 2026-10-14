@@ -6488,14 +6488,17 @@ function RelaySection ({ subLabel }) {
   const [available, setAvailable] = useState(false)
   useEffect(() => {
     // Settings mounts at app start, often before the worklet is ready: then
-    // relay:get throws or is never answered. Ask again until it answers.
+    // relay:get answers { ok: false, error } or nothing at all. Ask again
+    // until it answers with the setting.
     let stopped = false
     let timer = null
+    const again = () => { if (!stopped) timer = setTimeout(ask, 2000) }
     const ask = () => {
       callWithTimeout('relay:get', undefined, { timeoutMs: 3000, retries: 0 }).then((r) => {
-        if (r && typeof r.useRelay === 'boolean') setUseRelay(r.useRelay)
-        if (r && typeof r.available === 'boolean') setAvailable(r.available)
-      }).catch(() => { if (!stopped) timer = setTimeout(ask, 2000) })
+        if (!r || typeof r.available !== 'boolean') return again()
+        if (typeof r.useRelay === 'boolean') setUseRelay(r.useRelay)
+        setAvailable(r.available)
+      }).catch(again)
     }
     ask()
     pear.on('relay:changed', (data) => {

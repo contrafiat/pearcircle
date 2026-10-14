@@ -41,6 +41,7 @@ const Protomux = require('protomux')
 const { signValue, verifyValue, verifyValueWithSigner } = require('./lib/sign')
 const { shouldAcceptSeederRow, buildSeederRevoke, buildSeederAdmission, buildSeederGone, sanitizeSeederNickname } = require('./lib/seederApply')
 const plsClient = require('./peerloom-seeder/client.js')
+const { DROP_GRACE_MS: PLS_DROP_GRACE_MS } = require('./peerloom-seeder/protocol.js')
 const plsRecord = require('./lib/peerloomSeeder')
 const { shouldAcceptSupersede, supersedePendingNext } = require('./lib/supersedeApply')
 const { setupSeederAdmissionChannel } = require('./seederAdmission')
@@ -6928,11 +6929,14 @@ async function plsForget (seederKey) {
   }
   await _localDb.del(PLS_LOCAL + seederKey)
   plsSweep()
-  // In the background, so an offline seeder does not hold up the screen; one
-  // asker per circle so the requests go in parallel.
+  // In the background, so an offline seeder does not hold up the screen. One
+  // asker, so the requests go one after another over one connection at a
+  // time: parallel connections from the same key lost requests (the seeder
+  // keeps one connection per peer).
+  const asker = plsClient.createAsker({ dht: () => plsDht(), keyPair })
   for (const bootstrap of drops) {
-    plsClient.createAsker({ dht: () => plsDht(), keyPair })
-      .ask(seederKey, { t: 'drop', bootstrap }, 10000)
+    asker
+      .ask(seederKey, { t: 'drop', bootstrap, afterMs: PLS_DROP_GRACE_MS }, 10000)
       .then(() => mark('pls:drop', { seeder: seederKey.slice(0, 8) }))
       .catch((e) => mark('pls:drop-failed', { seeder: seederKey.slice(0, 8), error: e?.message }))
   }
