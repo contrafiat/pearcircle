@@ -1616,8 +1616,18 @@ function SeederModal ({ title, text, busy = false, confirmLabel, danger = false,
   )
 }
 
-function PeerloomSeederSection ({ active = true }) {
+// The one seeder section: pair PeerLoom Seeder or an older PearCircle Seeder
+// with the same scan (the link says which), and list both.
+const OLD_SEEDER_LINK = 'pear://pearcircle/seeder-pair'
+const linkBtnStyle = {
+  padding: 0, background: 'transparent', border: 'none', cursor: 'pointer',
+  color: colors.primary, fontFamily: typography.fontFamily, fontSize: 13,
+}
+
+function SeederSection ({ active = true }) {
   const [seeders, setSeeders] = useState([])
+  const [pasting, setPasting] = useState(false)
+  const [oldReload, setOldReload] = useState(0)
   const [showPrompt, setShowPrompt] = useState(false)
   const [link, setLink] = useState('')
   const [busy, setBusy] = useState(false)
@@ -1645,14 +1655,28 @@ function PeerloomSeederSection ({ active = true }) {
     const clean = String(text || '').trim().replace(/^[a-z]+:/i, (m) => m.toLowerCase())
     if (!clean) return
     setBusy(true); setMsg(null)
-    setModal({ busy: true, title: 'Pairing with PeerLoom Seeder...', text: 'This can take up to a minute.' })
+    setModal({ busy: true, title: 'Pairing...', text: 'This can take up to a minute.' })
     try {
-      const r = await plsCall('pls:pair', { link: clean })
+      if (clean.startsWith(OLD_SEEDER_LINK)) {
+        const r = await pear.call('seeder:pair:scan', { link: clean })
+        if (!r?.ok) throw new Error(r?.error || 'Pairing failed')
+        setOldReload((n) => n + 1)
+        setMsg(`Paired. ${r.enrolled ?? 0} ${r.enrolled === 1 ? 'circle is' : 'circles are'} backing up to it.`)
+      } else {
+        const r = await plsCall('pls:pair', { link: clean })
+        setMsg(`Paired. ${r?.circles ?? 0} ${r?.circles === 1 ? 'circle is' : 'circles are'} backing up to it.`)
+      }
       setLink('')
+      setPasting(false)
       setModal(null)
-      setMsg(`Paired. ${r?.circles ?? 0} ${r?.circles === 1 ? 'circle is' : 'circles are'} backing up to it.`)
     } catch (e) {
-      setModal({ title: 'Could not pair', text: String(e?.message ?? e), onClose: () => setModal(null), closeLabel: 'OK' })
+      const m = String(e?.message ?? e)
+      const text = /invalid pairing link|not a .*link|pairing link/i.test(m)
+        ? 'That is not a seeder pairing code.'
+        : /timed out|did not answer/i.test(m)
+          ? 'Could not reach the seeder. Check that its dashboard still shows the code, then try again. If it keeps failing, turn off WiFi and pair over cellular.'
+          : m
+      setModal({ title: 'Could not pair', text, onClose: () => setModal(null), closeLabel: 'OK' })
     }
     setBusy(false); refresh()
   }
@@ -1705,12 +1729,10 @@ function PeerloomSeederSection ({ active = true }) {
   }
 
   return (
-    <div style={{ marginBottom: spacing.xl }}>
-      <p style={{ ...s.muted, color: colors.text.primary, fontWeight: 600, marginBottom: spacing.xs }}>PeerLoom Seeder</p>
+    <div>
       <p style={{ ...s.muted, marginTop: 0 }}>
-        Keeps your circles in sync while your phones sleep. It serves all your PeerLoom apps,
-        stores your circles scrambled and cannot read them. A new member still needs someone
-        in the circle online to join.
+        A seeder is an always-on computer that keeps your circles in sync while phones
+        sleep. It stores them scrambled and cannot read them.
       </p>
       {showPrompt && (
         <div data-testid='pls-prompt' style={{ ...s.section }}>
@@ -1724,6 +1746,28 @@ function PeerloomSeederSection ({ active = true }) {
           </div>
         </div>
       )}
+      <button onClick={scan} disabled={busy} style={s.primaryBtn}>Scan seeder QR</button>
+      {pasting ? (
+        <div style={{ display: 'flex', gap: spacing.sm, marginTop: spacing.sm }}>
+          <input value={link} onChange={(e) => setLink(e.target.value)} placeholder='Paste the seeder link'
+            aria-label='Seeder pairing link' autoCapitalize='none' autoCorrect='off' spellCheck={false} autoFocus
+            style={{ flex: 1, minWidth: 0, padding: spacing.sm, fontSize: typography.caption.fontSize, borderRadius: radius.md,
+              border: `1px solid ${colors.text.muted}`, background: colors.surface.input, color: colors.text.primary }} />
+          <button onClick={() => pairWith(link)} disabled={busy || !link.trim()}
+            style={{ padding: `${spacing.sm}px ${spacing.md}px`, borderRadius: radius.md, cursor: 'pointer',
+              border: `1px solid ${colors.primary}`, background: 'transparent', color: colors.primary, opacity: busy || !link.trim() ? 0.5 : 1 }}>
+            Pair
+          </button>
+        </div>
+      ) : null}
+      <div style={{ display: 'flex', justifyContent: 'space-between', gap: spacing.sm, marginTop: spacing.sm }}>
+        <button onClick={() => setPasting((v) => !v)} style={linkBtnStyle}>{pasting ? 'Cancel' : 'Paste a link instead'}</button>
+        <button onClick={() => { try { pear.call('shell:openUrl', { url: 'https://peerloomllc.com/seeder' }) } catch {} }}
+          style={{ ...linkBtnStyle, display: 'flex', alignItems: 'center', gap: spacing.xs }}>
+          Get PeerLoom Seeder <ArrowSquareOut size={14} weight='thin' />
+        </button>
+      </div>
+      {msg && <p style={{ ...s.muted, marginBottom: 0 }}>{msg}</p>}
       {seeders.map((sd) => (
         <div key={sd.seederKey} style={{ ...s.section }}>
           <div style={{ display: 'flex', alignItems: 'center', gap: spacing.sm }}>
@@ -1754,19 +1798,7 @@ function PeerloomSeederSection ({ active = true }) {
           ) })}
         </div>
       ))}
-      <button onClick={scan} disabled={busy} style={s.primaryBtn}>Scan PeerLoom Seeder QR</button>
-      <div style={{ display: 'flex', gap: spacing.sm, marginTop: spacing.sm }}>
-        <input value={link} onChange={(e) => setLink(e.target.value)} placeholder='or paste peerloom://seeder?...'
-          aria-label='PeerLoom Seeder pairing link' autoCapitalize='none' autoCorrect='off' spellCheck={false}
-          style={{ flex: 1, minWidth: 0, padding: spacing.sm, fontSize: typography.caption.fontSize, borderRadius: radius.md,
-            border: `1px solid ${colors.text.muted}`, background: colors.surface.input, color: colors.text.primary }} />
-        <button onClick={() => pairWith(link)} disabled={busy || !link.trim()}
-          style={{ padding: `${spacing.sm}px ${spacing.md}px`, borderRadius: radius.md, cursor: 'pointer',
-            border: `1px solid ${colors.primary}`, background: 'transparent', color: colors.primary, opacity: busy || !link.trim() ? 0.5 : 1 }}>
-          Pair
-        </button>
-      </div>
-      {msg && <p style={{ ...s.muted, marginBottom: 0 }}>{msg}</p>}
+      <OldSeederRows active={active} reload={oldReload} />
       {modal && createPortal(<SeederModal {...modal} />, document.body)}
     </div>
   )
@@ -1777,13 +1809,14 @@ function PeerloomSeederSection ({ active = true }) {
 // device" mints seed invites for every encrypted circle at once (no
 // encryption key in any of them — that's the privacy boundary); the
 // list shows each admitted seeder device grouped across its circles.
-function SeedersSection ({ active = true }) {
+// Seeders paired the older way (the PearCircle Seeder app), listed in the
+// seeder section under PeerLoom Seeder's. Pairing them is the section's scan
+// button; this keeps their own controls (revoke, re-admit, auto-follow,
+// remove). `reload` changes after a pairing so the list refreshes at once.
+function OldSeederRows ({ active = true, reload = 0 }) {
   const [seeders, setSeeders] = useState([])
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState(null)
-  const [bundle, setBundle] = useState(null)
-  const [bundleInfo, setBundleInfo] = useState(null)
-  const [minting, setMinting] = useState(false)
   const [confirmingRevoke, setConfirmingRevoke] = useState(null)
   const [confirmingRemove, setConfirmingRemove] = useState(null)
   const [pending, setPending] = useState(null)
@@ -1792,13 +1825,6 @@ function SeedersSection ({ active = true }) {
   // does the compare; the seeder wire stays unchanged (it only reports its own
   // version). Best-effort: a fetch failure just means no "update available" hint.
   const [latestVersion, setLatestVersion] = useState(null)
-  // QR pairing (proposal 2026-06-22): scan the seeder's "Pair a phone" QR and
-  // push our circles to it over P2P, no copy-paste.
-  const [pairing, setPairing] = useState(false)
-  const [pairResult, setPairResult] = useState(null)
-  // Seconds left before the worklet gives up on the scan. Shown so the wait has
-  // a visible end instead of an indefinite "Pairing..." (issue #179).
-  const [pairSecs, setPairSecs] = useState(0)
 
   const refresh = useCallback(async () => {
     try {
@@ -1812,44 +1838,12 @@ function SeedersSection ({ active = true }) {
     }
   }, [])
 
-  const scanSeeder = useCallback(async () => {
-    setError(null); setPairResult(null)
-    let text
-    try {
-      text = await pear.call('shell:scanQr')
-    } catch (e) { setError('Scan failed: ' + (e?.message ?? e)); return }
-    if (typeof text !== 'string' || text.trim().length === 0) return // cancelled
-    setPairing(true)
-    try {
-      const r = await pear.call('seeder:pair:scan', { link: text.trim() })
-      if (r?.ok) { setPairResult(r); refresh() }
-      else setError(r?.error || 'Pairing failed')
-    } catch (e) {
-      const m = String(e?.message ?? e)
-      setError(/invalid pairing link/i.test(m)
-        ? 'That QR is not a seeder pairing code.'
-        : (/timed out/i.test(m)
-          ? "Could not reach the seeder. If your phone is on the same WiFi as the seeder, turn WiFi off (use cellular) and try again: a seeder running on a home server often can only be paired over the internet. Also check its dashboard is showing the QR."
-          : m))
-    } finally { setPairing(false) }
-  }, [refresh])
-
   useEffect(() => {
     if (!active) return
     refresh()
     const id = setInterval(refresh, 5000)
     return () => clearInterval(id)
-  }, [active, refresh])
-
-  // Countdown while a scan is in flight. Mirrors SEEDER_PAIR_SCAN_TIMEOUT_MS in
-  // the worklet, which stays the authority: this only labels the wait, so a
-  // little drift is harmless and the worklet's own timer still ends it.
-  useEffect(() => {
-    if (!pairing) { setPairSecs(0); return }
-    setPairSecs(SEEDER_PAIR_SCAN_SECONDS)
-    const id = setInterval(() => setPairSecs((n) => (n > 0 ? n - 1 : 0)), 1000)
-    return () => clearInterval(id)
-  }, [pairing])
+  }, [active, refresh, reload])
 
   // Fetch the latest published seeder version once per open of the section.
   useEffect(() => {
@@ -1868,25 +1862,6 @@ function SeedersSection ({ active = true }) {
       .catch(() => {})
     return () => { cancelled = true }
   }, [active])
-
-  const mintBundle = async () => {
-    setMinting(true)
-    setError(null)
-    try {
-      const r = await callWithTimeout('circle:invite:seed:all')
-      if (!r?.bundle) {
-        setBundle(null)
-        setError('No encrypted circles yet. Seed invites need a circle created with encryption.')
-      } else {
-        setBundle(r.bundle)
-        setBundleInfo({ count: r.invites?.length ?? 0, skipped: r.skipped ?? 0 })
-      }
-    } catch (e) {
-      setError(e?.code === 'IPC_TIMEOUT' ? 'Minting the seed invite is taking too long. Please try again.' : String(e?.message ?? e))
-    } finally {
-      setMinting(false)
-    }
-  }
 
   // Revocation is per-circle at the protocol level; "revoke everywhere"
   // loops circle:seeder:revoke across every live circle this device seeds.
@@ -1956,8 +1931,6 @@ function SeedersSection ({ active = true }) {
     }
   }
 
-  const openURL = (url) => { try { pear.call('shell:openUrl', { url }) } catch {} }
-
   // Each seeder device, with its circles split into live and revoked. A
   // fully-revoked device stays in the list so the user can re-admit it —
   // durable revocation (proposal 2026-05-21 amendment) makes re-admission
@@ -1982,117 +1955,9 @@ function SeedersSection ({ active = true }) {
 
   return (
     <div>
-      <p style={s.muted}>
-        A seeder is an always-on computer (a Raspberry Pi, an old laptop, a spare
-        desktop) that keeps a copy of your circles' encrypted data. Without one, a
-        circle only syncs while two members have the app open at the same moment.
-        A seeder closes that gap, so everyone's locations and history stay current
-        even when all the phones are asleep. It never receives the encryption key,
-        so it cannot read anything it stores.
-      </p>
-      <p style={s.muted}>
-        Install the free PearCircle Seeder app (macOS, Windows or Linux) on that
-        computer, then set up a device below to link it to your circles.
-      </p>
-      {pairResult ? (
-        <div style={{ ...s.section, textAlign: 'center' }}>
-          <p style={{ margin: 0, color: colors.text.primary, fontSize: typography.body.fontSize }}>
-            Paired! Now seeding {pairResult.enrolled} {pairResult.enrolled === 1 ? 'circle' : 'circles'}
-            {Array.isArray(pairResult.names) && pairResult.names.length > 0 ? ` (${pairResult.names.join(', ')})` : ''}.
-          </p>
-          <button
-            onClick={() => setPairResult(null)}
-            style={{
-              width: '100%', marginTop: spacing.sm, padding: `${spacing.sm + 2}px`,
-              background: 'transparent', color: colors.text.primary,
-              border: `1px solid ${colors.text.muted}`, borderRadius: radius.md,
-              cursor: 'pointer', fontFamily: typography.fontFamily, fontSize: 14,
-            }}>
-            Done
-          </button>
-        </div>
-      ) : (
-        <>
-          <button onClick={scanSeeder} disabled={pairing} style={s.primaryBtn}>
-            {pairing ? (
-              <span style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', gap: spacing.sm }}>
-                <span
-                  data-testid='pair-spinner'
-                  style={{
-                    width: 14, height: 14, borderRadius: '50%', flexShrink: 0, display: 'inline-block',
-                    border: '2px solid rgba(0, 0, 0, 0.22)', borderTopColor: colors.text.onPrimary,
-                    animation: 'pearcircle-focus-spin 0.8s linear infinite',
-                  }}
-                />
-                Pairing{pairSecs > 0 ? ` (${pairSecs}s)` : ''}
-              </span>
-            ) : 'Scan seeder QR'}
-          </button>
-          <p style={{ ...s.muted, textAlign: 'center', marginTop: spacing.sm, marginBottom: 0 }}>
-            {pairing
-              ? 'Talking to the seeder. Keep this screen open. If it gives up, turn off WiFi and try again so your phone pairs over cellular.'
-              : 'On the seeder\'s dashboard, tap "Pair a phone" and scan the code. Tip: if it won\'t connect, turn off WiFi so your phone pairs over cellular.'}
-          </p>
-        </>
-      )}
-      <button
-        onClick={mintBundle}
-        disabled={minting}
-        style={{
-          width: '100%', marginTop: spacing.sm, padding: `${spacing.sm + 2}px`,
-          background: 'transparent', color: colors.text.primary,
-          border: `1px solid ${colors.text.muted}`, borderRadius: radius.md,
-          cursor: 'pointer', fontFamily: typography.fontFamily, fontSize: 14,
-        }}>
-        {minting ? 'Building invites...' : 'Or set up by pasting an invite'}
-      </button>
-      <button
-        onClick={() => openURL('https://github.com/peerloomllc/pearcircle/releases')}
-        style={{
-          width: '100%', marginTop: spacing.sm, padding: `${spacing.sm + 2}px`,
-          background: 'transparent', color: colors.text.primary,
-          border: `1px solid ${colors.text.muted}`, borderRadius: radius.md,
-          cursor: 'pointer', fontFamily: typography.fontFamily, fontSize: 14,
-          display: 'flex', alignItems: 'center', justifyContent: 'center', gap: spacing.sm,
-        }}>
-        Download the seeder app <ArrowSquareOut size={14} weight='thin' />
-      </button>
       {error && <p style={s.error}>{error}</p>}
-
-      {bundle && (
-        <div style={{ marginTop: spacing.md }}>
-          <p style={s.muted}>
-            This bundle carries a seed invite for {bundleInfo?.count ?? 0}{' '}
-            {bundleInfo?.count === 1 ? 'circle' : 'circles'}
-            {bundleInfo?.skipped > 0
-              ? ` (${bundleInfo.skipped} legacy circle${bundleInfo.skipped === 1 ? '' : 's'} skipped — only encrypted circles can use a seeder)`
-              : ''}.
-            Send it to your seeder device and paste it into the PearCircle Seeder app. Each
-            circle's members still approve the seeder before it can replicate.
-          </p>
-          <textarea style={s.inviteBox} readOnly value={bundle} onFocus={(e) => e.target.select()} />
-          <ShareButton text={bundle} title='Set up a PearCircle seeder' />
-          <button
-            onClick={() => { setBundle(null); setBundleInfo(null) }}
-            style={{
-              width: '100%', marginTop: spacing.sm, padding: `${spacing.sm + 2}px`,
-              background: 'transparent', color: colors.text.primary,
-              border: `1px solid ${colors.text.muted}`, borderRadius: radius.md,
-              cursor: 'pointer', fontFamily: typography.fontFamily, fontSize: 14,
-            }}>
-            Done
-          </button>
-        </div>
-      )}
-
-      {loading && <p style={{ ...s.muted, marginTop: spacing.md }}>Loading...</p>}
-      {!loading && seederRows.length === 0 && (
-        <p style={{ ...s.muted, marginTop: spacing.md }}>
-          No seeders admitted yet. Set one up above, then approve it when it announces.
-        </p>
-      )}
       {seederRows.length > 0 && (
-        <ul style={{ listStyle: 'none', padding: 0, margin: `${spacing.md}px 0 0 0` }}>
+        <ul style={{ listStyle: 'none', padding: 0, margin: `${spacing.sm}px 0 0 0` }}>
           {seederRows.map((seeder) => {
             const isPending = pending === seeder.pubkey
             const labelLine = seeder.label || ('Seeder ' + seeder.pubkey.slice(0, 8))
@@ -2107,7 +1972,7 @@ function SeedersSection ({ active = true }) {
                 <div style={{ display: 'flex', alignItems: 'center', gap: spacing.sm }}>
                   <div style={{ flex: 1, minWidth: 0 }}>
                     <div style={{ ...typography.body, color: colors.text.primary, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                      {labelLine}
+                      {labelLine} <span style={{ ...typography.caption, color: colors.text.muted }}>(PearCircle Seeder)</span>
                     </div>
                     {seeder.heldCircles.length > 0 && (
                       <div style={{ ...typography.caption, color: colors.text.secondary }}>
@@ -6146,8 +6011,7 @@ function ProfileView ({ active = true, profile, sharing, setSharingForCircle, ti
           grows with every seeder and circle, and a clipped list hid the relay
           switch below it. */}
       <Collapsible title='Seeders & relay' icon={HardDrives} open={openSection === 'seeders'} onToggle={() => toggleSection('seeders')} maxHeight='8000px'>
-        <PeerloomSeederSection active={active && openSection === 'seeders'} />
-        <SeedersSection active={active && openSection === 'seeders'} />
+        <SeederSection active={active && openSection === 'seeders'} />
         {/* Renders nothing (heading included) on a build with no relay key. */}
         <div style={{ marginTop: spacing.xl }}>
           <RelaySection subLabel={subLabel} />
