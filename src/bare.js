@@ -6856,7 +6856,7 @@ async function plsPair (link) {
 }
 
 // Seeders this phone paired with plus any a circle names, each with its
-// circles, and whether to show the "replaces the PearCircle seeder" prompt.
+// circles, and whether to show the note that PeerLoom Seeder exists.
 async function plsList () {
   const me = b4a.toString(_identity.publicKey, 'hex')
   const seeders = new Map()

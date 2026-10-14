@@ -53,8 +53,9 @@ them or joining the topic.
    own device (local unpair). Other members see the seeder and who added it, but no
    remove button.
 6. **Old seeders.** `seeder:` rows, seed mode and the launcher packages keep working.
-   Settings shows once: "PeerLoom Seeder replaces the PearCircle seeder and serves all
-   your PeerLoom apps" with Set up and Not now (product phase 6). Nothing is removed
+   Settings shows once: "There is now PeerLoom Seeder: one seeder for all your PeerLoom
+   apps. You can use it, keep your PearCircle seeder, or both." with Set up and Not now
+   (wording changed by Tim on 2026-10-13: a notice, not a migration). Nothing is removed
    automatically.
 
 Not in scope: retiring seed mode or its packages; changing `seeder:` rows.
