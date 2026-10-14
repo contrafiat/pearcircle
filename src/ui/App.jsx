@@ -1576,6 +1576,8 @@ function PeerloomSeederSection ({ active = true }) {
   const [link, setLink] = useState('')
   const [busy, setBusy] = useState(false)
   const [msg, setMsg] = useState(null)
+  const [stopping, setStopping] = useState({}) // seederKey -> true while Stop using runs
+  const [pending, setPending] = useState({}) // seederKey:circleId -> the switch's new state
 
   const refresh = useCallback(async () => {
     try {
@@ -1612,14 +1614,29 @@ function PeerloomSeederSection ({ active = true }) {
   }
 
   const setCircle = async (seederKey, circleId, on) => {
+    const id = seederKey + ':' + circleId
+    setPending((p) => ({ ...p, [id]: on }))
     try { await plsCall('pls:circle:set', { seederKey, circleId, on }) } catch (e) { setMsg(String(e?.message ?? e)) }
-    refresh()
+    await refresh()
+    setPending((p) => { const { [id]: _, ...rest } = p; return rest })
   }
 
   const forget = async (seederKey) => {
     haptic('medium')
-    try { await plsCall('pls:forget', { seederKey }) } catch (e) { setMsg(String(e?.message ?? e)) }
-    refresh()
+    setStopping((st) => ({ ...st, [seederKey]: true }))
+    setMsg(null)
+    try {
+      const r = await plsCall('pls:forget', { seederKey })
+      const kept = r?.kept ?? []
+      if (kept.length) {
+        const list = kept.map((c) => c.addedByName ? `${c.name} (added by ${c.addedByName})` : c.name).join(', ')
+        setMsg(`Stopped on this phone. ${kept.length === 1 ? 'This circle still uses it' : 'These circles still use it'}: ${list}. Only whoever added it, the circle owner or a co-owner can remove it there.`)
+      } else {
+        setMsg('Stopped using this seeder.')
+      }
+    } catch (e) { setMsg(String(e?.message ?? e)) }
+    await refresh()
+    setStopping((st) => { const { [seederKey]: _, ...rest } = st; return rest })
   }
 
   const dismissPrompt = async () => {
@@ -1654,15 +1671,19 @@ function PeerloomSeederSection ({ active = true }) {
               {sd.seederKey.slice(0, 16)}...
             </span>
             {sd.paired && (
-              <button onClick={() => forget(sd.seederKey)}
-                style={{ padding: `${spacing.xs}px ${spacing.sm}px`, fontSize: typography.caption.fontSize, borderRadius: radius.md,
-                  cursor: 'pointer', border: `1px solid ${colors.error}`, background: 'transparent', color: colors.error }}>
-                Stop using
+              <button onClick={() => forget(sd.seederKey)} disabled={!!stopping[sd.seederKey]}
+                style={{ display: 'flex', alignItems: 'center', gap: spacing.xs, padding: `${spacing.xs}px ${spacing.sm}px`, fontSize: typography.caption.fontSize, borderRadius: radius.md,
+                  cursor: stopping[sd.seederKey] ? 'default' : 'pointer', border: `1px solid ${colors.error}`, background: 'transparent', color: colors.error }}>
+                {stopping[sd.seederKey] && (
+                  <span data-testid='pls-stop-spinner' style={{ width: 10, height: 10, borderRadius: '50%', flexShrink: 0, display: 'inline-block',
+                    border: `2px solid ${colors.error}`, borderTopColor: 'transparent', animation: 'pearcircle-focus-spin 0.8s linear infinite' }} />
+                )}
+                {stopping[sd.seederKey] ? 'Stopping...' : 'Stop using'}
               </button>
             )}
           </div>
-          {sd.circles.map((c) => (
-            <div key={c.circleId} style={{ display: 'flex', alignItems: 'center', gap: spacing.md, marginTop: spacing.sm, opacity: c.canChange ? 1 : 0.6 }}>
+          {sd.circles.map((c) => { const p = pending[sd.seederKey + ':' + c.circleId]; const busyRow = p !== undefined || !!stopping[sd.seederKey]; return (
+            <div key={c.circleId} style={{ display: 'flex', alignItems: 'center', gap: spacing.md, marginTop: spacing.sm, opacity: c.canChange && !busyRow ? 1 : 0.6 }}>
               <div style={{ flex: 1, minWidth: 0 }}>
                 <div style={{ color: colors.text.primary, fontSize: typography.body.fontSize }}>{c.name}</div>
                 {c.on && !c.canChange && (
@@ -1671,9 +1692,10 @@ function PeerloomSeederSection ({ active = true }) {
                   </div>
                 )}
               </div>
-              <ToggleSwitch on={c.on} disabled={!c.canChange} onChange={(v) => setCircle(sd.seederKey, c.circleId, v)} />
+              {p !== undefined && <span style={{ ...typography.caption, color: colors.text.muted }}>{p ? 'Adding...' : 'Removing...'}</span>}
+              <ToggleSwitch on={p !== undefined ? p : c.on} disabled={!c.canChange || busyRow} onChange={(v) => setCircle(sd.seederKey, c.circleId, v)} />
             </div>
-          ))}
+          ) })}
         </div>
       ))}
       <button onClick={scan} disabled={busy} style={s.primaryBtn}>{busy ? 'Pairing...' : 'Scan PeerLoom Seeder QR'}</button>
