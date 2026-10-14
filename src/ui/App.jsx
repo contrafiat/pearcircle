@@ -1638,8 +1638,8 @@ function PeerloomSeederSection ({ active = true }) {
       {showPrompt && (
         <div data-testid='pls-prompt' style={{ ...s.section }}>
           <p style={{ margin: 0, color: colors.text.primary, fontSize: typography.body.fontSize }}>
-            PeerLoom Seeder replaces the PearCircle seeder and serves all your PeerLoom apps.
-            Set it up, then pair this phone. Your PearCircle seeder keeps working until you remove it.
+            There is now PeerLoom Seeder: one seeder for all your PeerLoom apps. You can use it,
+            keep your PearCircle seeder, or both.
           </p>
           <div style={{ display: 'flex', gap: spacing.sm, marginTop: spacing.sm }}>
             <button onClick={() => { dismissPrompt(); scan() }} style={{ ...s.primaryBtn, flex: 1 }}>Set up</button>
