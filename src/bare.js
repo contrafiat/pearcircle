@@ -6855,8 +6855,9 @@ async function plsPair (link) {
   }
 }
 
-// Seeders this phone paired with plus any a circle names, each with its
-// circles, and whether to show the note that PeerLoom Seeder exists.
+// Seeders this phone paired with plus any a circle still uses, each with its
+// circles, and whether to show the note that PeerLoom Seeder exists. A seeder
+// every circle has removed and this phone is not paired with is left out.
 async function plsList () {
   const me = b4a.toString(_identity.publicKey, 'hex')
   const seeders = new Map()
@@ -6871,7 +6872,9 @@ async function plsList () {
     try {
       for await (const { key, value } of base.view.createReadStream({ gt: plsRecord.PREFIX, lt: plsRecord.PREFIX + '~' })) {
         const k = plsRecord.parseRecordKey(key)
-        if (k) { rows.set(k, value); entry(k) }
+        if (!k) continue
+        rows.set(k, value)
+        if (value && !value.revoked) entry(k)
       }
       for await (const { value } of base.view.createReadStream({ gt: 'seeder:', lt: 'seeder:~' })) {
         if (value && !value.revoked && !value.left) oldSeeders++
@@ -6903,22 +6906,37 @@ async function plsList () {
 }
 
 // Stop using a seeder from this phone: take it off the circles this phone may
-// change, ask it to drop them (after its 7-day grace, unless someone else
-// still backs them up there) and forget the pairing.
+// change and forget the pairing, then ask it to drop those circles (after its
+// 7-day grace, unless someone else still backs them up there). Returns the
+// circles that keep it because someone else added it.
 async function plsForget (seederKey) {
   const keyPair = await plsKeyPair()
-  const asker = plsClient.createAsker({ dht: () => plsDht(), keyPair })
   const me = b4a.toString(_identity.publicKey, 'hex')
+  const drops = []
+  const kept = []
   for (const [circleId, base] of _circleBases) {
     const row = (await base.view.get(plsRecord.recordKey(seederKey)).catch(() => null))?.value
     if (!row || row.revoked) continue
-    const { ownerKey, coowners } = await plsCircleAuth(base)
-    if (plsRecord.canChange({ me, existing: row, ownerKey, coowners })) await plsWriteRow(circleId, seederKey, false).catch(() => {})
-    await asker.ask(seederKey, { t: 'drop', bootstrap: b4a.toString(base.key, 'hex') }).catch(() => {})
+    const { circle, ownerKey, coowners } = await plsCircleAuth(base)
+    if (plsRecord.canChange({ me, existing: row, ownerKey, coowners })) {
+      await plsWriteRow(circleId, seederKey, false).catch(() => {})
+    } else {
+      const member = (await base.view.get('member:' + row.addedBy).catch(() => null))?.value
+      kept.push({ circleId, name: circle?.name || 'Circle', addedByName: member?.displayName || null })
+    }
+    drops.push(b4a.toString(base.key, 'hex'))
   }
   await _localDb.del(PLS_LOCAL + seederKey)
   plsSweep()
-  return { ok: true }
+  // In the background, so an offline seeder does not hold up the screen; one
+  // asker per circle so the requests go in parallel.
+  for (const bootstrap of drops) {
+    plsClient.createAsker({ dht: () => plsDht(), keyPair })
+      .ask(seederKey, { t: 'drop', bootstrap }, 10000)
+      .then(() => mark('pls:drop', { seeder: seederKey.slice(0, 8) }))
+      .catch((e) => mark('pls:drop-failed', { seeder: seederKey.slice(0, 8), error: e?.message }))
+  }
+  return { ok: true, kept }
 }
 
 // Write a signed seeder:{pubkey} admission row. Extracted from the

@@ -1570,12 +1570,60 @@ async function plsCall (method, args) {
   return r
 }
 
+// The PeerLoom Seeder section's modal: a question with two buttons, a
+// spinner while something runs, or a result with one button.
+function SeederModal ({ title, text, busy = false, confirmLabel, danger = false, onConfirm, onClose, closeLabel = 'Cancel' }) {
+  return (
+    <div data-testid='pls-modal' style={{
+      position: 'fixed', inset: 0, zIndex: 300,
+      display: 'flex', alignItems: 'center', justifyContent: 'center',
+      background: 'rgba(0,0,0,0.6)', padding: spacing.lg,
+    }}>
+      <div style={{
+        background: colors.surface.elevated, borderRadius: radius.lg,
+        padding: spacing.lg, maxWidth: 400, width: '100%',
+        border: `1px solid ${colors.border}`, textAlign: 'center',
+      }}>
+        {busy && (
+          <span data-testid='pls-modal-spinner' style={{
+            width: 28, height: 28, borderRadius: '50%', display: 'inline-block', marginBottom: spacing.md,
+            border: `3px solid ${colors.border}`, borderTopColor: colors.primary,
+            animation: 'pearcircle-focus-spin 0.8s linear infinite',
+          }} />
+        )}
+        <div style={{ ...typography.heading, color: colors.text.primary, marginBottom: text ? spacing.sm : 0 }}>{title}</div>
+        {text && <div style={{ ...typography.body, color: colors.text.secondary }}>{text}</div>}
+        {!busy && (onConfirm || onClose) && (
+          <div style={{ marginTop: spacing.lg }}>
+            {onConfirm && (
+              <button data-haptic='medium' onClick={onConfirm} style={{
+                width: '100%', padding: '12px', borderRadius: radius.md, border: 'none', cursor: 'pointer',
+                background: danger ? colors.error : colors.primary, color: danger ? '#fff' : colors.text.onPrimary,
+                fontFamily: typography.fontFamily, fontWeight: 500, fontSize: 14, marginBottom: spacing.sm,
+              }}>{confirmLabel}</button>
+            )}
+            {onClose && (
+              <button onClick={onClose} style={{
+                width: '100%', padding: '12px', borderRadius: radius.md, cursor: 'pointer',
+                background: 'transparent', color: colors.text.secondary, border: `1px solid ${colors.border}`,
+                fontFamily: typography.fontFamily, fontWeight: 400, fontSize: 14,
+              }}>{closeLabel}</button>
+            )}
+          </div>
+        )}
+      </div>
+    </div>
+  )
+}
+
 function PeerloomSeederSection ({ active = true }) {
   const [seeders, setSeeders] = useState([])
   const [showPrompt, setShowPrompt] = useState(false)
   const [link, setLink] = useState('')
   const [busy, setBusy] = useState(false)
   const [msg, setMsg] = useState(null)
+  const [modal, setModal] = useState(null) // the SeederModal's props, or null
+  const [pending, setPending] = useState({}) // seederKey:circleId -> the switch's new state
 
   const refresh = useCallback(async () => {
     try {
@@ -1596,12 +1644,16 @@ function PeerloomSeederSection ({ active = true }) {
     // Phone keyboards capitalise the first letter of a typed link.
     const clean = String(text || '').trim().replace(/^[a-z]+:/i, (m) => m.toLowerCase())
     if (!clean) return
-    setBusy(true); setMsg('Pairing...')
+    setBusy(true); setMsg(null)
+    setModal({ busy: true, title: 'Pairing with PeerLoom Seeder...', text: 'This can take up to a minute.' })
     try {
       const r = await plsCall('pls:pair', { link: clean })
       setLink('')
+      setModal(null)
       setMsg(`Paired. ${r?.circles ?? 0} ${r?.circles === 1 ? 'circle is' : 'circles are'} backing up to it.`)
-    } catch (e) { setMsg(String(e?.message ?? e)) }
+    } catch (e) {
+      setModal({ title: 'Could not pair', text: String(e?.message ?? e), onClose: () => setModal(null), closeLabel: 'OK' })
+    }
     setBusy(false); refresh()
   }
 
@@ -1612,15 +1664,40 @@ function PeerloomSeederSection ({ active = true }) {
   }
 
   const setCircle = async (seederKey, circleId, on) => {
+    const id = seederKey + ':' + circleId
+    setPending((p) => ({ ...p, [id]: on }))
     try { await plsCall('pls:circle:set', { seederKey, circleId, on }) } catch (e) { setMsg(String(e?.message ?? e)) }
-    refresh()
+    await refresh()
+    setPending((p) => { const { [id]: _, ...rest } = p; return rest })
   }
 
   const forget = async (seederKey) => {
-    haptic('medium')
-    try { await plsCall('pls:forget', { seederKey }) } catch (e) { setMsg(String(e?.message ?? e)) }
-    refresh()
+    setMsg(null)
+    setModal({ busy: true, title: 'Stopping...' })
+    const close = () => setModal(null)
+    try {
+      const r = await plsCall('pls:forget', { seederKey })
+      await refresh()
+      const kept = r?.kept ?? []
+      if (kept.length) {
+        const list = kept.map((c) => c.addedByName ? `${c.name} (added by ${c.addedByName})` : c.name).join(', ')
+        setModal({ title: 'Stopped on this phone', text: `${kept.length === 1 ? 'This circle still uses it' : 'These circles still use it'}: ${list}. Only whoever added it, the circle owner or a co-owner can remove it there.`, onClose: close, closeLabel: 'OK' })
+      } else {
+        close()
+        setMsg('Stopped using this seeder.')
+      }
+    } catch (e) {
+      await refresh()
+      setModal({ title: 'Could not stop', text: String(e?.message ?? e), onClose: close, closeLabel: 'OK' })
+    }
   }
+
+  const askForget = (seederKey) => setModal({
+    title: 'Stop using this seeder?',
+    text: 'Your circles stop backing up to it, except where someone else added it.',
+    confirmLabel: 'Stop using', danger: true,
+    onConfirm: () => forget(seederKey), onClose: () => setModal(null),
+  })
 
   const dismissPrompt = async () => {
     setShowPrompt(false)
@@ -1654,15 +1731,15 @@ function PeerloomSeederSection ({ active = true }) {
               {sd.seederKey.slice(0, 16)}...
             </span>
             {sd.paired && (
-              <button onClick={() => forget(sd.seederKey)}
+              <button onClick={() => askForget(sd.seederKey)}
                 style={{ padding: `${spacing.xs}px ${spacing.sm}px`, fontSize: typography.caption.fontSize, borderRadius: radius.md,
                   cursor: 'pointer', border: `1px solid ${colors.error}`, background: 'transparent', color: colors.error }}>
                 Stop using
               </button>
             )}
           </div>
-          {sd.circles.map((c) => (
-            <div key={c.circleId} style={{ display: 'flex', alignItems: 'center', gap: spacing.md, marginTop: spacing.sm, opacity: c.canChange ? 1 : 0.6 }}>
+          {sd.circles.map((c) => { const p = pending[sd.seederKey + ':' + c.circleId]; const busyRow = p !== undefined; return (
+            <div key={c.circleId} style={{ display: 'flex', alignItems: 'center', gap: spacing.md, marginTop: spacing.sm, opacity: c.canChange && !busyRow ? 1 : 0.6 }}>
               <div style={{ flex: 1, minWidth: 0 }}>
                 <div style={{ color: colors.text.primary, fontSize: typography.body.fontSize }}>{c.name}</div>
                 {c.on && !c.canChange && (
@@ -1671,12 +1748,13 @@ function PeerloomSeederSection ({ active = true }) {
                   </div>
                 )}
               </div>
-              <ToggleSwitch on={c.on} disabled={!c.canChange} onChange={(v) => setCircle(sd.seederKey, c.circleId, v)} />
+              {p !== undefined && <span style={{ ...typography.caption, color: colors.text.muted }}>{p ? 'Adding...' : 'Removing...'}</span>}
+              <ToggleSwitch on={p !== undefined ? p : c.on} disabled={!c.canChange || busyRow} onChange={(v) => setCircle(sd.seederKey, c.circleId, v)} />
             </div>
-          ))}
+          ) })}
         </div>
       ))}
-      <button onClick={scan} disabled={busy} style={s.primaryBtn}>{busy ? 'Pairing...' : 'Scan PeerLoom Seeder QR'}</button>
+      <button onClick={scan} disabled={busy} style={s.primaryBtn}>Scan PeerLoom Seeder QR</button>
       <div style={{ display: 'flex', gap: spacing.sm, marginTop: spacing.sm }}>
         <input value={link} onChange={(e) => setLink(e.target.value)} placeholder='or paste peerloom://seeder?...'
           aria-label='PeerLoom Seeder pairing link' autoCapitalize='none' autoCorrect='off' spellCheck={false}
@@ -1689,6 +1767,7 @@ function PeerloomSeederSection ({ active = true }) {
         </button>
       </div>
       {msg && <p style={{ ...s.muted, marginBottom: 0 }}>{msg}</p>}
+      {modal && createPortal(<SeederModal {...modal} />, document.body)}
     </div>
   )
 }
