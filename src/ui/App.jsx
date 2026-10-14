@@ -1932,9 +1932,8 @@ function OldSeederRows ({ active = true, reload = 0 }) {
   }
 
   // Each seeder device, with its circles split into live and revoked. A
-  // fully-revoked device stays in the list so the user can re-admit it —
-  // durable revocation (proposal 2026-05-21 amendment) makes re-admission
-  // an explicit action, so the row must remain reachable.
+  // device revoked from every circle is hidden; re-admission stays explicit
+  // (proposal 2026-05-21 amendment): scanning its code again does it.
   // A circle counts as actually held only once the seeder has checked in for
   // it. The admission row on its own proves nothing: it is written locally for
   // every followed seeder when a circle is created, so a switched-off machine
@@ -1951,7 +1950,9 @@ function OldSeederRows ({ active = true, reload = 0 }) {
         lastSeenAt: s.lastSeenAt,
       }
     })
-    .filter((sd) => sd.liveCircles.length + sd.revokedCircles.length > 0)
+    // Only seeders a circle still uses; scanning a removed one's code again
+    // brings it back.
+    .filter((sd) => sd.liveCircles.length > 0)
 
   return (
     <div>
@@ -6486,13 +6487,21 @@ function RelaySection ({ subLabel }) {
   const [useRelay, setUseRelay] = useState(true)
   const [available, setAvailable] = useState(false)
   useEffect(() => {
-    pear.call('relay:get').then((r) => {
-      if (r && typeof r.useRelay === 'boolean') setUseRelay(r.useRelay)
-      if (r && typeof r.available === 'boolean') setAvailable(r.available)
-    }).catch(() => {})
+    // Settings mounts at app start, often before the worklet is ready: then
+    // relay:get throws or is never answered. Ask again until it answers.
+    let stopped = false
+    let timer = null
+    const ask = () => {
+      callWithTimeout('relay:get', undefined, { timeoutMs: 3000, retries: 0 }).then((r) => {
+        if (r && typeof r.useRelay === 'boolean') setUseRelay(r.useRelay)
+        if (r && typeof r.available === 'boolean') setAvailable(r.available)
+      }).catch(() => { if (!stopped) timer = setTimeout(ask, 2000) })
+    }
+    ask()
     pear.on('relay:changed', (data) => {
       if (data && typeof data.useRelay === 'boolean') setUseRelay(data.useRelay)
     })
+    return () => { stopped = true; clearTimeout(timer) }
   }, [])
   const toggle = useCallback(async (value) => {
     if (value === useRelay) return

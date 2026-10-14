@@ -7098,6 +7098,26 @@ async function writeSeederGone (circleId, base, pubkey) {
   return true
 }
 
+// Re-admit a seeder in every circle this phone can write to where its row
+// is revoked (the same steps as circle:seeder:approve).
+async function reAdmitRevokedSeeder (pubkey) {
+  for (const [circleId, base] of _circleBases) {
+    if (!base.writable) continue
+    const row = (await base.view.get('seeder:' + pubkey).catch(() => null))?.value
+    if (!row?.revoked) continue
+    try {
+      const result = await approveSeederRow(circleId, pubkey)
+      if (result?.reAdmit) {
+        notifySeederAdmitted(circleId, pubkey, result.updatedAt)
+        resumeSeederReplication(pubkey)
+      }
+      mark('seeder:pair:readmitted', { circleId: circleId.slice(0, 8), seeder: pubkey.slice(0, 8) })
+    } catch (e) {
+      mark('seeder:pair:readmit-failed', { circleId: circleId.slice(0, 8), err: e?.message ?? String(e) })
+    }
+  }
+}
+
 // Write seeder:{pubkey} admission rows for every followed seeder into a
 // circle's autobase. Called on circle:create so an auto-followed
 // seeder's admission lands immediately and locally — no dependence on a
@@ -7229,6 +7249,9 @@ function maybeSetupPairScanChannel (conn, remotePubkeyHex) {
       // circle-topic sync channels (no re-pairing). Same row shape as
       // circle:seeder:follow:set.
       try { await _localDb.put('seederfollow:' + session.seederKeyHex, { pubkey: session.seederKeyHex, since: Date.now() }) } catch {}
+      // Scanning its code again is a deliberate choice, like Re-admit: the
+      // list hides a seeder revoked from every circle, so this is the way back.
+      await reAdmitRevokedSeeder(session.seederKeyHex)
       mark('seeder:pair:acked', { enrolled })
       finishPairScan({ ok: true, enrolled, names, seeder: session.seederKeyHex })
     },
