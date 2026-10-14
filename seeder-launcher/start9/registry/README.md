@@ -72,12 +72,11 @@ sends `/package/v0/pearcircle-seeder.s9pk` to the GitHub Release asset (the s9pk
 is 720 MiB, over Cloudflare's 25 MiB per-file limit). Registry URL users add:
 `https://www.peerloomllc.com`.
 
-On a seeder release this is automated end to end by the release pipeline:
-`build-start9-s9pk.sh` builds + uploads the s9pk to the tag, then
+`build-start9-s9pk.sh` builds the s9pk, then
 `seeder-launcher/scripts/publish-start9-registry.sh` regenerates the metadata,
 bumps `_redirects` to the new tag, and (with `WEBSITE_REGISTRY_PR=1`) opens +
-squash-merges the website PR — the merge is the deploy. `release.sh` runs both
-(step 5d + 7b) when `WEBSITE_DIR` points at a website clone.
+squash-merges the website PR - the merge is the deploy. `scripts/release.sh` used
+to run both. It stopped on 2026-10-14, when PeerLoom Seeder replaced this seeder.
 
 To refresh it by hand (e.g. a metadata-only fix), run against a website clone:
 

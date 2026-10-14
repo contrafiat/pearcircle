@@ -98,7 +98,8 @@ store's own `version:` field. `seeder-launcher/scripts/build-umbrel-image.sh`
 automates it: set `OFFICIAL_STORE_DIR` to a clone of the `peerloomllc/umbrel-apps`
 fork and it cuts a fresh per-release branch off upstream, bumps the manifest +
 image digest, and (with `OFFICIAL_STORE_PR=1`) opens/refreshes the getumbrel PR
-via `gh`. `release.sh` exposes this as `UMBREL_OFFICIAL_DIR` / `UMBREL_OFFICIAL_PR`.
+via `gh`. `scripts/release.sh` no longer builds or publishes the seeder (removed
+2026-10-14, PeerLoom Seeder replaces it), so run the script by hand if needed.
 
 ## Networking note
 
