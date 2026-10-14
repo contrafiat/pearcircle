@@ -14,23 +14,23 @@ version: 1.1.4
 release-notes: |
   New Features
 
-    - **Back up your account.** Save your name, account and circles to one password-protected file. If you lose your phone or reinstall the app, restore it and everything comes back, including your place in each circle.
-    - **Automatic backup.** Pick a folder once and PearCircle keeps your backup up to date there. Choose a folder that syncs to another device or the cloud and your circles are safe even if your phone is lost.
-    - **Restore from the welcome screen.** Starting fresh on a new phone? Tap "Restore from a backup" and pick up where you left off.
-    - **Co-owners.** A circle's owner can make other members co-owners. Co-owners can rename, recreate or delete the circle and remove members, so the circle keeps running even if the owner loses their phone.
-    - **Hide old entries.** If someone reinstalled the app and now shows up twice, any member can hide the old entry once it hasn't been seen for 30 days. If that person turns out to still be around, they reappear on their own.
-    - **Any member can export a circle.** Save a circle's name and Places to a file, optionally with a password, and import it later to start a fresh copy that you own.
+    - **Back up your circles to PeerLoom Seeder.** PeerLoom Seeder is one seeder app for all your PeerLoom apps. Pair it with PearCircle by scanning its QR code. It keeps a copy of your circles so members can catch up even when nobody else's phone is online. Your circles stay private: the seeder can't read names or places.
+    - **Choose which circles to back up.** Each circle has its own switch. Any member can add a seeder to a circle. Only the person who added it, the owner or a co-owner can remove it.
+    - **Already have a PearCircle Seeder?** It keeps working. You can keep using it, switch to PeerLoom Seeder or use both.
 
   Improvements
 
-    - **Simpler Settings.** Settings is now seven sections instead of nine. Pausing your location and sharing trips are together under Sharing, all your
-    alerts are under Notifications, and saving circles to a file has moved to Backup.
-    - **Backup reminder.** If you haven't backed up in a while, a gentle reminder shows on the map.
-    - **Tidier pop-ups.** Pop-up titles are now centered.
+    - **One place for seeders.** Settings now shows all your seeders in one list. The same Scan button pairs either kind of seeder.
+    - **Clearer feedback.** Pairing with a seeder or stopping one now shows a progress screen, then closes when it's done. If something goes wrong you see what happened, and you never get a "Paired" message for a pairing that failed.
+    - **Seeders that sit behind a home router now connect.** If a direct connection fails, PearCircle reaches the seeder through the relay.
+    - **Faster setup.** Seeders that are offline no longer slow things down.
 
   Bug Fixes
 
-    - Removing someone from a circle now sticks. Before, it could quietly undo itself if they had the app open.
+    - Seeders you stopped using no longer stay in your list.
+    - When you stop using a seeder, it keeps your backup for 7 days in case another member still uses it.
+    - The relay switch in Settings sometimes didn't appear after the app started. It now always shows.
+    - Desktop seeder downloads are back on the latest release, and the seeder's update check no longer offers an older version
 license: MIT
 wrapper-repo: "https://github.com/peerloomllc/pearcircle"
 upstream-repo: "https://github.com/peerloomllc/pearcircle"
