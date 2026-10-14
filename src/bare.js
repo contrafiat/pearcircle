@@ -6906,7 +6906,7 @@ async function plsList () {
 }
 
 // Stop using a seeder from this phone: take it off the circles this phone may
-// change, forget the pairing, then ask it to drop those circles (after its
+// change and forget the pairing, then ask it to drop those circles (after its
 // 7-day grace, unless someone else still backs them up there). Returns the
 // circles that keep it because someone else added it.
 async function plsForget (seederKey) {
@@ -6928,10 +6928,14 @@ async function plsForget (seederKey) {
   }
   await _localDb.del(PLS_LOCAL + seederKey)
   plsSweep()
-  // One asker per circle so the requests go in parallel: an unreachable
-  // seeder costs one timeout, not one per circle.
-  await Promise.all(drops.map((bootstrap) => plsClient.createAsker({ dht: () => plsDht(), keyPair })
-    .ask(seederKey, { t: 'drop', bootstrap }, 10000).catch(() => {})))
+  // In the background, so an offline seeder does not hold up the screen; one
+  // asker per circle so the requests go in parallel.
+  for (const bootstrap of drops) {
+    plsClient.createAsker({ dht: () => plsDht(), keyPair })
+      .ask(seederKey, { t: 'drop', bootstrap }, 10000)
+      .then(() => mark('pls:drop', { seeder: seederKey.slice(0, 8) }))
+      .catch((e) => mark('pls:drop-failed', { seeder: seederKey.slice(0, 8), error: e?.message }))
+  }
   return { ok: true, kept }
 }
 
