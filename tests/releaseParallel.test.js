@@ -1,7 +1,6 @@
-// release.sh runs the seeder builds as background jobs and uploads the GitHub
-// release assets several at a time. These cases run the real blocks from the
-// script against stub build scripts and a fake curl, so they check ordering,
-// exit statuses and cleanup without building or uploading anything.
+// release.sh uploads the GitHub release assets several at a time as background
+// jobs. These cases run the real blocks from the script against a fake curl, so
+// they check concurrency, exit statuses and cleanup without uploading anything.
 
 const fs = require('fs')
 const os = require('os')
@@ -32,27 +31,13 @@ function tmp () {
   return fs.mkdtempSync(path.join(os.tmpdir(), 'release-par-'))
 }
 
-test('_bg_follow shows the job\'s matching log lines and returns its exit status', () => {
-  const dir = tmp()
-  const log = path.join(dir, 'job.log')
-  const r = run(`
-job() { echo "==> step one" > "${log}"; echo "noise" >> "${log}"; sleep 1; echo "==> step two" >> "${log}"; return 3; }
-_bg_start job job
-if _bg_follow job "${log}" '^==>'; then echo "rc=0"; else echo "rc=$?"; fi
-`)
-  expect(r.status).toBe(0)
-  expect(r.stdout).toContain('      ==> step one')
-  expect(r.stdout).toContain('      ==> step two')
-  expect(r.stdout).not.toContain('noise')
-  expect(r.stdout).toContain('rc=3')
-})
-
 test('exiting the script kills background jobs and their children', () => {
   const dir = tmp()
   const pidFile = path.join(dir, 'child.pid')
   const r = run(`
 job() { sleep 60 & echo $! > "${pidFile}"; wait; }
-_bg_start job job
+job < /dev/null &
+_BG_PIDS+=("$!")
 while [ ! -s "${pidFile}" ]; do sleep 0.1; done
 exit 0
 `)
@@ -61,48 +46,6 @@ exit 0
   let alive = true
   try { process.kill(child, 0) } catch { alive = false }
   expect(alive).toBe(false)
-})
-
-test('desktop builds: Linux and macOS start at once, Windows waits for Linux and the Android build', () => {
-  const dir = tmp()
-  const sl = path.join(dir, 'seeder-launcher')
-  const bin = path.join(dir, 'bin')
-  const trace = path.join(dir, 'trace')
-  fs.mkdirSync(path.join(sl, 'scripts'), { recursive: true })
-  fs.mkdirSync(bin)
-  const stub = (name, secs) => fs.writeFileSync(path.join(sl, 'scripts', name),
-    `echo "start ${name} $(date +%s.%N)" >> "${trace}"; sleep ${secs}; echo "end ${name} $(date +%s.%N)" >> "${trace}"\n`)
-  stub('build-linux.sh', 1)
-  stub('build-windows-local.sh', 0)
-  stub('build-macos-remote.sh', 0)
-  fs.writeFileSync(path.join(bin, 'npm'), '#!/bin/sh\nexit 0\n', { mode: 0o755 })
-
-  const launch = between('_SLV="${RELEASE_TAG#v}"', '# ---------------------------------------------------------------------------\n# 3. Build signed release APK')
-    .replace('_SL="$REPO_ROOT/seeder-launcher"', `_SL="${sl}"`)
-    .replaceAll('/tmp/pearcircle-build-', `${dir}/build-`)
-
-  const r = run(`
-RELEASE_TAG=v9.9.9; REPO_ROOT="${dir}"
-SKIP_DESKTOP=false; SKIP_LINUX=false; SKIP_WINDOWS=false; SKIP_MACOS=false
-${launch}
-sleep 2.5
-echo "android-done $(date +%s.%N)" >> "${trace}"
-touch "$_BG_DIR/android.done"
-for j in linux windows macos; do if _bg_wait $j; then echo "$j ok"; else echo "$j failed"; fi; done
-`, { PATH: `${bin}:${process.env.PATH}` })
-  expect(r.stderr).toBe('')
-  expect(r.stdout).toMatch(/linux ok\nwindows ok\nmacos ok/)
-
-  const t = {}
-  for (const line of fs.readFileSync(trace, 'utf8').trim().split('\n')) {
-    const parts = line.split(' ')
-    t[parts.slice(0, -1).join(' ')] = Number(parts.at(-1))
-  }
-  const androidDone = t['android-done']
-  expect(t['start build-linux.sh']).toBeLessThan(androidDone)
-  expect(t['start build-macos-remote.sh']).toBeLessThan(androidDone)
-  expect(t['start build-windows-local.sh']).toBeGreaterThanOrEqual(t['end build-linux.sh'])
-  expect(t['start build-windows-local.sh']).toBeGreaterThanOrEqual(androidDone)
 })
 
 const UPLOAD = between('  # --- Upload the assets, UPLOAD_JOBS', '\nelse\n  # Fallback: gh CLI')

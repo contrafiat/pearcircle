@@ -8,19 +8,8 @@
 #   --check-versions   Query GitHub and Zapstore versions and exit (no build)
 #   --skip-play        Skip Google Play upload even if credentials are configured
 #   --skip-nostr       Skip Nostr announcement even if selected
-#   --skip-desktop     Skip building all desktop seeder-launcher installers
-#   --skip-linux       Skip Linux desktop builds (.deb + .AppImage)
-#   --skip-windows     Skip Windows desktop build (.exe)
-#   --skip-macos       Skip macOS desktop build (.pkg)
-#   --skip-umbrel      Skip building + pushing the multi-arch Umbrel/Docker image
-#   --skip-start9      Skip building the StartOS (Start9) .s9pk (auto-skips if the
-#                      StartOS SDK toolchain is absent)
-#   --skip-start9-legacy
-#                      Do not publish the legacy StartOS 0.3.5 .s9pk (it is still
-#                      built, since the 0.4 package is converted from it). The
-#                      pre-flight asks, and defaults to skipping it.
 #   --skip-android     Skip Android APK/AAB build (auto-disables Play + Zapstore;
-#                      the GitHub release re-attaches the previous APK)
+#                      a GitHub release re-attaches the previous APK)
 #   --skip-ios         Skip iOS App Store build
 #   --skip-mobile      Skip both Android and iOS builds (shorthand)
 #
@@ -102,20 +91,13 @@ for _k in APP_NAME ARTIFACT_PREFIX XCODE_PROJECT; do
 done
 
 # ---------------------------------------------------------------------------
-# Helper: background builds
+# Helper: background jobs
 #
-# The seeder builds are slow and do not depend on each other, so they run as
-# background jobs instead of one after another. The desktop installers start
-# after the verify gate (step 1) and build alongside the Android build and the
-# release-notes review. The Umbrel image, then Start9, starts once step 5 has
-# written the notes into the store manifests. Each job writes only to its own
-# log, with stdin closed so it never reads from the terminal. Steps 5b-5d wait
-# for them and report in the usual order. Any exit (a declined confirm, a
-# failed build, Ctrl-C) kills whatever is still running.
+# Step 7 uploads release assets as parallel background jobs. Any exit (a
+# declined confirm, a failed upload, Ctrl-C) kills whatever is still running.
 # ---------------------------------------------------------------------------
 _BG_DIR=$(mktemp -d)
 _BG_PIDS=()
-declare -A _BG_PID=()
 
 _bg_kill_tree() {
   local _c
@@ -132,42 +114,9 @@ _bg_cleanup() {
 }
 trap _bg_cleanup EXIT
 
-# Usage: _bg_start <name> <command...>
-_bg_start() {
-  local _name="$1"; shift
-  "$@" < /dev/null &
-  _BG_PID[$_name]=$!
-  _BG_PIDS+=("$!")
-}
-
-# Usage: _bg_wait <name>  - returns the job's exit status (127 if never started)
-_bg_wait() {
-  local _pid="${_BG_PID[$1]:-}"
-  [ -n "$_pid" ] || return 127
-  wait "$_pid"
-}
-
-# Usage: _bg_follow <name> <log> <regex>
-# Prints the log's matching lines, indented, until the job ends, then returns
-# its exit status. Lines the job logged before this call are shown too.
-_bg_follow() {
-  local _pid="${_BG_PID[$1]:-}"
-  [ -n "$_pid" ] || return 127
-  tail --pid="$_pid" -n +1 -F "$2" 2>/dev/null \
-    | grep --line-buffered -E "$3" \
-    | awk '{ print "      " $0; fflush() }' || true
-  wait "$_pid"
-}
-
-# Usage: _bg_after <pid>  - blocks until that job has ended (no-op for "")
-_bg_after() {
-  [ -n "${1:-}" ] || return 0
-  while kill -0 "$1" 2>/dev/null; do sleep 2; done
-}
-
 # ---------------------------------------------------------------------------
 # Helper: does the latest GitHub release carry an APK built for its own version?
-# False for a seeder-only release, whose APK is carried forward from an older one.
+# False for a release made with --skip-android, whose APK was carried forward.
 # A failed query answers true, which keeps the pre-flight's old behavior.
 # Usage: _github_latest_has_own_apk <token> <slug> <X.Y.Z>
 # ---------------------------------------------------------------------------
@@ -234,59 +183,6 @@ print(results[0].get('version', '') if results else '')
 }
 
 # ---------------------------------------------------------------------------
-# Helper: fetch the latest version tag published for the Umbrel/Docker seeder
-# image on the ghcr registry. The package is public, so an anonymous pull
-# token suffices (no GITHUB_TOKEN needed). Returns the highest X.Y.Z tag or "".
-# build-umbrel-image.sh pushes ${IMAGE}:${VERSION} (no :latest), so we list all
-# tags and pick the max semver.
-# ---------------------------------------------------------------------------
-_umbrel_latest_version() {
-  local image="${1:-ghcr.io/peerloomllc/pearcircle-seeder}"
-  local host="${image%%/*}"   # ghcr.io
-  local repo="${image#*/}"    # peerloomllc/pearcircle-seeder
-
-  local token
-  token=$(curl -s --max-time 8 \
-    "https://${host}/token?scope=repository:${repo}:pull" 2>/dev/null \
-    | python3 -c "import sys,json; print(json.load(sys.stdin).get('token',''))" \
-    2>/dev/null || echo "")
-  [ -z "$token" ] && echo "" && return
-
-  curl -s --max-time 8 \
-    -H "Authorization: Bearer $token" \
-    "https://${host}/v2/${repo}/tags/list" 2>/dev/null \
-    | python3 -c "
-import sys, json
-try:
-    tags = json.load(sys.stdin).get('tags', []) or []
-except Exception:
-    tags = []
-best = ()
-for t in tags:
-    parts = tuple(int(x) for x in t.lstrip('v').split('.') if x.isdigit())
-    if len(parts) == 3 and parts > best:
-        best = parts
-if best:
-    print('.'.join(str(x) for x in best))
-" 2>/dev/null || echo ""
-}
-
-# ---------------------------------------------------------------------------
-# Helper: fetch the version the live StartOS (Start9) community registry
-# advertises — what StartOS users see as available. Distinct from the ghcr
-# image tag above: the s9pk is built from that image, but the registry is served
-# from the website and updated by a separate publish (release step 7b + a
-# website PR merge), so it can lag the image. The marketplace protocol's
-# GET /package/v0/latest returns {"pearcircle-seeder":"X.Y.Z"}.
-# ---------------------------------------------------------------------------
-_start9_latest_version() {
-  local url="${1:-https://www.peerloomllc.com/package/v0/latest}"
-  curl -fsS --max-time 10 "$url" 2>/dev/null \
-    | python3 -c "import sys,json; print(json.load(sys.stdin).get('pearcircle-seeder','') or '')" \
-    2>/dev/null || echo ""
-}
-
-# ---------------------------------------------------------------------------
 # Helper: authenticate asc CLI on the local (Linux) machine.
 # Returns 1 if asc is not installed or the .p8 key file is missing.
 # ---------------------------------------------------------------------------
@@ -319,17 +215,8 @@ RETAG=false
 CHECK_VERSIONS_ONLY=false
 SKIP_PLAY=false
 SKIP_NOSTR=false
-SKIP_DESKTOP=false
-SKIP_LINUX=false
-SKIP_WINDOWS=false
-SKIP_MACOS=false
 SKIP_ANDROID=false
 SKIP_IOS=false
-SKIP_UMBREL=false
-SKIP_START9=false
-# The legacy 0.3.5 package is being phased out: publishing it is opt-in.
-SKIP_START9_LEGACY=true
-_START9_LEGACY_FLAG=false
 
 for arg in "$@"; do
   case "$arg" in
@@ -337,13 +224,6 @@ for arg in "$@"; do
     --check-versions) CHECK_VERSIONS_ONLY=true ;;
     --skip-play) SKIP_PLAY=true ;;
     --skip-nostr) SKIP_NOSTR=true ;;
-    --skip-desktop) SKIP_DESKTOP=true ;;
-    --skip-linux) SKIP_LINUX=true ;;
-    --skip-windows) SKIP_WINDOWS=true ;;
-    --skip-macos) SKIP_MACOS=true ;;
-    --skip-umbrel) SKIP_UMBREL=true ;;
-    --skip-start9) SKIP_START9=true ;;
-    --skip-start9-legacy) _START9_LEGACY_FLAG=true ;;
     --skip-android) SKIP_ANDROID=true ;;
     --skip-ios) SKIP_IOS=true ;;
     --skip-mobile) SKIP_ANDROID=true; SKIP_IOS=true ;;
@@ -445,10 +325,6 @@ GH_VERSION=$(_github_latest_version "$GH_TOKEN" "$REPO_SLUG")
 ZSP_VERSION_CURRENT=$(_zapstore_latest_version "$ZSP_IDENTIFIER")
 PLAY_VERSION_CURRENT=$(_play_latest_version "$ZSP_IDENTIFIER" "${PLAY_SERVICE_ACCOUNT_JSON:-}" "${PLAY_TRACK:-production}")
 ASC_VERSION_CURRENT=$(_appstore_latest_version "${BUNDLE_ID:-com.pearcircle}")
-UMBREL_IMAGE="${UMBREL_IMAGE:-ghcr.io/peerloomllc/pearcircle-seeder}"
-UMBREL_VERSION_CURRENT=$(_umbrel_latest_version "$UMBREL_IMAGE")
-START9_REGISTRY_URL="${START9_REGISTRY_URL:-https://www.peerloomllc.com/package/v0/latest}"
-START9_VERSION_CURRENT=$(_start9_latest_version "$START9_REGISTRY_URL")
 
 echo "    GitHub       : ${GH_VERSION:-unknown}"
 echo "    Zapstore     : ${ZSP_VERSION_CURRENT:-unknown}"
@@ -465,8 +341,6 @@ if [ -n "${ASC_KEY_ID:-}" ] && command -v asc &>/dev/null; then
 else
   echo "    App Store    : ${ASC_VERSION_CURRENT:-unknown} (live only; iTunes lookup)"
 fi
-echo "    Umbrel (ghcr): ${UMBREL_VERSION_CURRENT:-unknown} (${UMBREL_IMAGE})"
-echo "    Start9 (reg) : ${START9_VERSION_CURRENT:-unknown} (0.3.5 registry, lags when the legacy s9pk is skipped)"
 
 # --check-versions: print diagnostic info and exit without doing anything else
 if $CHECK_VERSIONS_ONLY; then
@@ -508,13 +382,6 @@ if $CHECK_VERSIONS_ONLY; then
       echo "    for richer queries that include TestFlight and in-review builds."
     fi
   fi
-  echo ""
-  if [ -n "$UMBREL_VERSION_CURRENT" ]; then
-    echo "    Umbrel/ghcr query succeeded: $UMBREL_VERSION_CURRENT ($UMBREL_IMAGE)"
-  else
-    echo "    Umbrel/ghcr query returned nothing for $UMBREL_IMAGE — image may not be"
-    echo "    published yet, the package may be private, or the registry was unreachable."
-  fi
   exit 0
 fi
 
@@ -523,12 +390,10 @@ if [ -n "${EXPLICIT_TAG:-}" ]; then
   ZSP_HAS_VERSION=false
   PLAY_HAS_VERSION=false
   ASC_HAS_VERSION=false
-  UMBREL_HAS_VERSION=false
   [ "$GH_VERSION" = "$APP_VERSION" ]           && GH_HAS_VERSION=true
   [ "$ZSP_VERSION_CURRENT" = "$APP_VERSION" ]  && ZSP_HAS_VERSION=true
   [ "$PLAY_VERSION_CURRENT" = "$APP_VERSION" ] && PLAY_HAS_VERSION=true
   [ "$ASC_VERSION_CURRENT"  = "$APP_VERSION" ] && ASC_HAS_VERSION=true
-  [ "$UMBREL_VERSION_CURRENT" = "$APP_VERSION" ] && UMBREL_HAS_VERSION=true
 
   # Build a human-readable summary of what's already published
   _already=""
@@ -536,7 +401,6 @@ if [ -n "${EXPLICIT_TAG:-}" ]; then
   $ZSP_HAS_VERSION    && _already="${_already}Zapstore, "
   $PLAY_HAS_VERSION   && _already="${_already}Google Play, "
   $ASC_HAS_VERSION    && _already="${_already}App Store, "
-  $UMBREL_HAS_VERSION && _already="${_already}Umbrel, "
   _already="${_already%, }"   # strip trailing comma+space
 
   # Check if all configured destinations already have this version
@@ -548,10 +412,6 @@ if [ -n "${EXPLICIT_TAG:-}" ]; then
   fi
   if [ -n "${ASC_APPLE_ID:-}" ] && [ -n "${ASC_APP_PASSWORD:-}" ]; then
     $ASC_HAS_VERSION || _all_have=false
-  fi
-  # Umbrel counts toward "all published" unless --skip-umbrel was passed.
-  if ! $SKIP_UMBREL; then
-    $UMBREL_HAS_VERSION || _all_have=false
   fi
 
   if $_all_have; then
@@ -598,12 +458,12 @@ else
       gt)
         echo ""
         echo "==> GitHub ($GH_VERSION) is ahead of Zapstore ($ZSP_VERSION_CURRENT)."
-        # A seeder-only release (--skip-android) is ahead of Zapstore on purpose: its
+        # A release made with --skip-android is ahead of Zapstore on purpose: its
         # APK was carried forward from an older version, so there is nothing new to
         # publish there. Build the next version instead of the Zapstore shortcut,
         # which would stop at the artifact/version mismatch check.
         if ! _github_latest_has_own_apk "$GH_TOKEN" "$REPO_SLUG" "$GH_VERSION"; then
-          echo "    v$GH_VERSION has no APK of its own (a seeder-only release) - proceeding with full build for next version."
+          echo "    v$GH_VERSION has no APK of its own (made with --skip-android) - proceeding with full build for next version."
         else
           echo "    Skipping build — will publish existing GitHub release to Zapstore only."
           RELEASE_TAG="v${GH_VERSION}"
@@ -712,9 +572,6 @@ APP_STORE_DEFERRED=false
 # In ZAPSTORE_ONLY mode the selection block is skipped because we're
 # publishing an existing GitHub release to Zapstore -- no build needed.
 NEEDS_BUILD=false
-# Desktop seeder installers (built in step 4d). Declared here so step 7's
-# asset loop stays safe even when the build block is skipped (e.g. --retag).
-DESKTOP_ARTIFACTS=()
 
 _play_configured && PUBLISH_PLAY=true
 
@@ -794,70 +651,6 @@ if ! $CHECK_VERSIONS_ONLY; then
   else
     PUBLISH_APP_STORE=false
     echo "    - Apple App Store (not configured - set ASC_KEY_ID + ASC_ISSUER_ID + ASC_APP_ID, or legacy ASC_APPLE_ID + ASC_APP_PASSWORD; ensure ${MAC_MINI_HOST:-Tims-Mac-mini.local} is reachable)"
-  fi
-
-  # Desktop seeder-launcher installers (attached to the GitHub release)
-  if $SKIP_DESKTOP; then
-    echo "    - Desktop seeder installers (skipped via --skip-desktop)"
-  else
-    while true; do
-      read -rp "    Build desktop seeder-launcher installers (Linux/Windows/macOS)? [Y/n] " _r
-      case "${_r:-y}" in
-        [Yy]) SKIP_DESKTOP=false; echo "    ✓ Desktop seeder installers"; break ;;
-        [Nn]) SKIP_DESKTOP=true;  echo "    ✗ Desktop seeder installers (skipped)"; break ;;
-        *) echo "    Please enter y or n." ;;
-      esac
-    done
-  fi
-
-  # Umbrel / Docker seeder image (multi-arch, built + pushed to ghcr)
-  if $SKIP_UMBREL; then
-    echo "    - Umbrel/Docker seeder image (skipped via --skip-umbrel)"
-  else
-    while true; do
-      read -rp "    Build + push the Umbrel/Docker seeder image (multi-arch, ghcr)? [Y/n] " _r
-      case "${_r:-y}" in
-        [Yy]) SKIP_UMBREL=false; echo "    ✓ Umbrel/Docker seeder image"; break ;;
-        [Nn]) SKIP_UMBREL=true;  echo "    ✗ Umbrel/Docker seeder image (skipped)"; break ;;
-        *) echo "    Please enter y or n." ;;
-      esac
-    done
-  fi
-
-  # StartOS (Start9) .s9pk — needs the StartOS SDK toolchain; auto-skip without it.
-  if $SKIP_START9; then
-    echo "    - StartOS (Start9) s9pk (skipped via --skip-start9)"
-  elif ! command -v start-sdk >/dev/null || ! command -v deno >/dev/null || ! command -v yq >/dev/null; then
-    SKIP_START9=true
-    echo "    - StartOS (Start9) s9pk (skipped — StartOS SDK toolchain not installed)"
-  else
-    while true; do
-      read -rp "    Build the StartOS (Start9) s9pk? [Y/n] " _r
-      case "${_r:-y}" in
-        [Yy]) SKIP_START9=false; echo "    ✓ StartOS (Start9) s9pk"; break ;;
-        [Nn]) SKIP_START9=true;  echo "    ✗ StartOS (Start9) s9pk (skipped)"; break ;;
-        *) echo "    Please enter y or n." ;;
-      esac
-    done
-  fi
-
-  # Legacy StartOS 0.3.5 .s9pk. It is always built when Start9 is, because the
-  # 0.4 package is converted from it, but it is ~3x the size and being phased
-  # out, so uploading it and refreshing the 0.3.5 registry is opt-in. Skipping
-  # leaves 0.3.5 boxes on the last legacy version already published.
-  if $SKIP_START9; then
-    :
-  elif $_START9_LEGACY_FLAG; then
-    echo "    - StartOS 0.3.5 legacy s9pk (skipped via --skip-start9-legacy)"
-  else
-    while true; do
-      read -rp "    Also publish the legacy StartOS 0.3.5 s9pk (large, being phased out)? [y/N] " _r
-      case "${_r:-n}" in
-        [Yy]) SKIP_START9_LEGACY=false; echo "    ✓ StartOS 0.3.5 legacy s9pk"; break ;;
-        [Nn]) SKIP_START9_LEGACY=true;  echo "    ✗ StartOS 0.3.5 legacy s9pk (skipped)"; break ;;
-        *) echo "    Please enter y or n." ;;
-      esac
-    done
   fi
 
   # Nostr announcement
@@ -1000,49 +793,6 @@ fi
 # ---------------------------------------------------------------------------
 echo "==> Native project: android/ is checked in, no prebuild needed."
 
-# Start the desktop seeder-launcher installers in the background (see "Helper:
-# background builds"). Step 5b collects them.
-#
-# Linux runs now. Windows waits for Linux, because both run `npm install` in
-# seeder-launcher, and for the Android build in step 3, because its
-# `npm install --force` in the repo root rewrites node_modules that Gradle
-# reads. macOS builds on the Mac mini and waits for nothing.
-_SLV="${RELEASE_TAG#v}"
-_SL="$REPO_ROOT/seeder-launcher"
-
-_desktop_linux() {
-  ( cd "$_SL" && npm install --no-audit --no-fund --loglevel=error ) \
-    > /tmp/pearcircle-build-linux.log 2>&1 || true
-  bash "$_SL/scripts/build-linux.sh" "$_SLV" >> /tmp/pearcircle-build-linux.log 2>&1
-}
-
-_desktop_windows() {
-  : > /tmp/pearcircle-build-windows.log
-  _bg_after "${1:-}"
-  while [ ! -e "$_BG_DIR/android.done" ]; do sleep 2; done
-  ( cd "$_SL" && npm install --no-audit --no-fund --loglevel=error
-    # The version package-lock pins: build-windows-local.sh refuses any other
-    # (fb97b4b), and an unpinned install pulled the newest and failed every
-    # Windows build from 1.1.2 to 1.1.5.
-    _WIN_BARE=$(node -p "require('$REPO_ROOT/package-lock.json').packages['node_modules/bare-runtime-win32-x64'].version" 2>/dev/null)
-    cd "$REPO_ROOT" && npm install "bare-runtime-win32-x64@${_WIN_BARE:-latest}" --os=win32 --cpu=x64 \
-      --force --no-save --no-audit --no-fund --loglevel=error ) \
-    >> /tmp/pearcircle-build-windows.log 2>&1 || true
-  bash "$_SL/scripts/build-windows-local.sh" "$_SLV" >> /tmp/pearcircle-build-windows.log 2>&1
-}
-
-_desktop_macos() {
-  APP_SIGN_ID="${MACOS_APP_SIGN_ID:-}" PKG_SIGN_ID="${MACOS_PKG_SIGN_ID:-}" \
-    bash "$_SL/scripts/build-macos-remote.sh" "$_SLV" > /tmp/pearcircle-build-macos.log 2>&1
-}
-
-if ! $SKIP_DESKTOP; then
-  echo "==> Starting desktop seeder-launcher builds in the background (collected at step 5b)..."
-  $SKIP_LINUX   || _bg_start linux _desktop_linux
-  $SKIP_WINDOWS || _bg_start windows _desktop_windows "${_BG_PID[linux]:-}"
-  $SKIP_MACOS   || _bg_start macos _desktop_macos
-fi
-
 # ---------------------------------------------------------------------------
 # 3. Build signed release APK (and AAB if publishing to Google Play)
 # ---------------------------------------------------------------------------
@@ -1096,8 +846,6 @@ else
     echo "==> Built AAB: $AAB_NAME  ($AAB_SIZE)"
   fi
 fi
-# Lets the background Windows build start (see the note above step 3).
-touch "$_BG_DIR/android.done"
 
 # ---------------------------------------------------------------------------
 # 4e. Generate .sha256 sidecars for the mobile artifacts
@@ -1115,7 +863,7 @@ if [ -n "$APK_NAME" ]; then _BUILD_SUMMARY="APK ($APK_SIZE)"; fi
 if $PUBLISH_PLAY    && [ -n "$AAB_NAME" ]; then
   _BUILD_SUMMARY="${_BUILD_SUMMARY:+$_BUILD_SUMMARY, }AAB ($AAB_SIZE)"
 fi
-[ -z "$_BUILD_SUMMARY" ] && _BUILD_SUMMARY="desktop installers only (no mobile artifacts)"
+[ -z "$_BUILD_SUMMARY" ] && _BUILD_SUMMARY="no mobile artifacts"
 _confirm "$_BUILD_SUMMARY look correct — proceed with release notes?"
 
 fi # end NEEDS_BUILD
@@ -1258,261 +1006,22 @@ if [ -d "$REPO_ROOT/metadata/ios/en-US" ]; then
   echo "    Updated metadata/ios/en-US/release_notes.txt"
 fi
 
-# Same notes into the two app-store manifests. Both were fossilised on their
-# first-release text while this script faithfully bumped their VERSION every
-# time, so anyone updating from either store was told they were installing the
-# first release. Start9's registry republishes the field, so it was served, not
-# just stored. Both files are already in _bump_paths, so the rewrite rides the
-# existing release commit.
+# Seeder builds and store publishing were removed on 2026-10-14: PeerLoom
+# Seeder (peerloomllc/peerloom-seeder) is now the one seeder for every app.
+
+# ---------------------------------------------------------------------------
+# 5e. Final gate before publishing
 #
-# A hard failure, deliberately: it runs before the tag, the build and any
-# publish, so aborting here costs nothing, and a warning that scrolls past in a
-# long release log is exactly how this class of bug keeps happening.
-echo "==> Writing release notes into the app-store manifests..."
-if ! node "$REPO_ROOT/seeder-launcher/scripts/write-store-release-notes.js" release_notes.md; then
-  echo "ERROR: could not write the store release notes - fix this before releasing," >&2
-  echo "       or the stores will advertise the previous version's notes again." >&2
-  exit 1
-fi
-
-# Start the Umbrel image and the Start9 package in the background now that the
-# notes are in their manifests (see "Helper: background builds"). Start9 waits
-# for Umbrel, because it pins the image Umbrel pushes. Steps 5c and 5d collect
-# them. The Start9 log is emptied up front so step 5d never shows the previous
-# release's lines while it waits.
-_umbrel_build() {
-  STORE_DIR="${UMBREL_STORE_DIR:-}" \
-  OFFICIAL_STORE_DIR="${UMBREL_OFFICIAL_DIR:-}" \
-  OFFICIAL_STORE_PR="${UMBREL_OFFICIAL_PR:-}" \
-    bash "$REPO_ROOT/seeder-launcher/scripts/build-umbrel-image.sh" "${RELEASE_TAG#v}" \
-    > /tmp/pearcircle-build-umbrel.log 2>&1
-}
-
-_start9_build() {
-  _bg_after "${1:-}"
-  bash "$REPO_ROOT/seeder-launcher/scripts/build-start9-s9pk.sh" "${RELEASE_TAG#v}" \
-    >> /tmp/pearcircle-build-start9.log 2>&1
-}
-
-if ! $SKIP_UMBREL; then
-  : > /tmp/pearcircle-build-umbrel.log
-  _bg_start umbrel _umbrel_build
-fi
-if ! $SKIP_START9 && command -v start-sdk >/dev/null && command -v deno >/dev/null && command -v yq >/dev/null; then
-  : > /tmp/pearcircle-build-start9.log
-  _bg_start start9 _start9_build "${_BG_PID[umbrel]:-}"
-fi
-[ -n "${_BG_PID[umbrel]:-}${_BG_PID[start9]:-}" ] && echo "==> Started the Umbrel/Start9 seeder builds in the background (collected at steps 5c-5d)."
-
+# The last look at the full asset list. This is the last confirm before
+# anything irreversible: step 6 commits and step 6b pushes the tag. See
+# RELEASE-PIPELINE.md §2.
 # ---------------------------------------------------------------------------
-# 5b. Build the desktop seeder-launcher installers
-#
-# The builds themselves started in the background before step 3 and have been
-# running unattended through the Android build and the release-notes review;
-# this step waits for them. Still gated on NEEDS_BUILD (no desktop build for a
-# Zapstore-only republish) and SKIP_DESKTOP.
-# Best-effort: each platform builds independently and a failure (Mac mini
-# unreachable, missing signing certs, build script not yet on this branch) is
-# logged and skipped, never blocking the mobile release.
-# Whatever builds is appended to DESKTOP_ARTIFACTS and uploaded with the
-# GitHub release in step 7.
-# ---------------------------------------------------------------------------
-if $NEEDS_BUILD; then
-if $SKIP_DESKTOP; then
-  echo "==> Skipping desktop seeder-launcher builds (--skip-desktop)."
-else
-  echo ""
-  echo "==> Waiting for the desktop seeder-launcher installers (building in the background)..."
-
-  if $SKIP_LINUX; then
-    echo "--> Linux    (skipped via --skip-linux)"
-  else
-    echo "--> Linux    (.deb + .AppImage, built locally)"
-    if _bg_wait linux; then
-      # Put the version in the AppImage names (the .deb, .pkg and .exe already
-      # carry it). The seeder update check reads an installer's version from
-      # its name, because a later release that skips the seeder builds carries
-      # these files forward under a newer tag.
-      for _arch in x86_64 aarch64; do
-        if [ -f "$_SL/dist/linux/PearCircleSeeder-${_arch}.AppImage" ]; then
-          mv -f "$_SL/dist/linux/PearCircleSeeder-${_arch}.AppImage" "$_SL/dist/linux/PearCircleSeeder-${_SLV}-${_arch}.AppImage"
-        fi
-      done
-      for _f in "$_SL/dist/linux/pearcircle-seeder_${_SLV}_amd64.deb" \
-                "$_SL/dist/linux/pearcircle-seeder_${_SLV}_arm64.deb" \
-                "$_SL/dist/linux/PearCircleSeeder-${_SLV}-x86_64.AppImage" \
-                "$_SL/dist/linux/PearCircleSeeder-${_SLV}-aarch64.AppImage"; do
-        if [ -f "$_f" ]; then DESKTOP_ARTIFACTS+=("$_f"); fi
-      done
-      echo "    Linux build OK."
-    else
-      echo "    WARNING: Linux seeder build failed, skipping it. Log: /tmp/pearcircle-build-linux.log"
-    fi
-  fi
-
-  if $SKIP_WINDOWS; then
-    echo "--> Windows  (skipped via --skip-windows)"
-  else
-    echo "--> Windows  (.exe, cross-built locally - no VM)"
-    if _bg_wait windows; then
-      _f="$_SL/dist/windows/PearCircleSeeder-Setup-${_SLV}.exe"
-      if [ -f "$_f" ]; then DESKTOP_ARTIFACTS+=("$_f"); fi
-      echo "    Windows build OK."
-    else
-      echo "    WARNING: Windows seeder build failed, skipping it. Log: /tmp/pearcircle-build-windows.log"
-    fi
-  fi
-
-  if $SKIP_MACOS; then
-    echo "--> macOS    (skipped via --skip-macos)"
-  else
-    echo "--> macOS    (.pkg, built on the Mac mini)"
-    if _bg_wait macos; then
-      _f="$_SL/dist/macos/PearCircleSeeder-${_SLV}.pkg"
-      if [ -f "$_f" ]; then DESKTOP_ARTIFACTS+=("$_f"); fi
-      echo "    macOS build OK."
-    else
-      echo "    WARNING: macOS seeder build failed, skipping it. Log: /tmp/pearcircle-build-macos.log"
-    fi
-  fi
-
-  for _f in "${DESKTOP_ARTIFACTS[@]}"; do
-    ( cd "$(dirname "$_f")" && sha256sum "$(basename "$_f")" > "$(basename "$_f").sha256" )
-  done
-
-  if [ ${#DESKTOP_ARTIFACTS[@]} -gt 0 ]; then
-    echo "==> Desktop installers built (${#DESKTOP_ARTIFACTS[@]}):"
-    for _f in "${DESKTOP_ARTIFACTS[@]}"; do
-      echo "    - $(basename "$_f")  ($(du -sh "$_f" | cut -f1))"
-    done
-  else
-    echo "==> No desktop installers produced (all skipped or failed); mobile release continues."
-  fi
-fi
-fi # end NEEDS_BUILD (desktop installers)
-
-# ---------------------------------------------------------------------------
-# 5c. Build + push the multi-arch Umbrel/Docker seeder image (amd64 + arm64)
-#
-# Independent of NEEDS_BUILD: the image only needs the version/tag, not the
-# mobile artifacts, so it tracks the destination-selection prompt (SKIP_UMBREL)
-# directly and still runs for Zapstore-only or desktop-only releases.
-#
-# Best-effort like the desktop builds: a failure (no podman, not logged in to
-# ghcr, qemu-user-static missing for the arm64 runtime step) is logged and
-# skipped, never blocking the release. On success build-umbrel-image.sh pushes
-# the manifest list, version-stamps it (SEEDER_VERSION build-arg), and bumps the
-# in-repo seeder-launcher/umbrel manifest to the new version + manifest-list
-# digest. The seeder is listed in two stores, each keyed off its own version:
-# field, so both need bumping per release:
-#   UMBREL_STORE_DIR     local clone of the PeerLoom community app store
-#                        (peerloom-umbrel-app-store) — bumped in place; commit +
-#                        push that repo yourself to publish.
-#   UMBREL_OFFICIAL_DIR  local clone of the official-store fork
-#                        (peerloomllc/umbrel-apps) — bumped on a fresh per-release
-#                        branch off upstream getumbrel/umbrel-apps; with
-#                        UMBREL_OFFICIAL_PR=1 it also pushes + opens/refreshes the
-#                        getumbrel update PR via `gh` (else it prints the commands).
-# ---------------------------------------------------------------------------
-if $SKIP_UMBREL; then
-  echo "==> Skipping Umbrel/Docker image build."
-else
-  echo ""
-  echo "==> Building + pushing the multi-arch Umbrel/Docker seeder image (amd64 + arm64, in the background)..."
-  echo "    Live milestones below — 'STEP N/M' = building, 'Copying blob' = pushing to ghcr."
-  echo "    Full log: /tmp/pearcircle-build-umbrel.log"
-  # Show milestone lines from the background build's log so this isn't a silent
-  # multi-minute wait. The job's own exit status is the build result.
-  if _bg_follow umbrel /tmp/pearcircle-build-umbrel.log \
-       '^==>|STEP [0-9]+/|Copying (blob|config)|Writing manifest|bumped |official store|refreshed |nothing to commit|WARNING|[Ee]rror'; then
-    _umbrel_status=0
-  else
-    _umbrel_status=$?
-  fi
-  if [ "$_umbrel_status" -eq 0 ]; then
-    echo "    Umbrel image OK ($(grep -oE 'digest=sha256:[0-9a-f]+' /tmp/pearcircle-build-umbrel.log | tail -1)). Log: /tmp/pearcircle-build-umbrel.log"
-    echo "    In-repo umbrel manifest bumped — review + commit it with the release."
-    [ -n "${UMBREL_STORE_DIR:-}" ] && echo "    Community store at $UMBREL_STORE_DIR bumped — commit + push that repo to publish (checked again at the end)."
-    if [ -n "${UMBREL_OFFICIAL_DIR:-}" ]; then
-      if [ "${UMBREL_OFFICIAL_PR:-}" = 1 ]; then
-        echo "    Official store: update PR pushed/refreshed — see $(grep -oE 'https://github.com/getumbrel/umbrel-apps/pull/[0-9]+' /tmp/pearcircle-build-umbrel.log | tail -1) (or the log)."
-      else
-        echo "    Official store: branch bumped at $UMBREL_OFFICIAL_DIR — set UMBREL_OFFICIAL_PR=1 to auto-open the PR, or follow the printed commands in the log."
-      fi
-    fi
-  else
-    echo "    WARNING: Umbrel image build/push failed, skipping it. Log: /tmp/pearcircle-build-umbrel.log"
-  fi
-fi
-
-# ---------------------------------------------------------------------------
-# 5d. Build the StartOS (Start9) universal .s9pk (x86_64 + aarch64)
-#
-# Runs after 5c because it pins the Start9 package to the freshly-pushed
-# pearcircle-seeder:${VERSION} manifest list (resolving its digest from ghcr).
-# Best-effort like the other packagers: any failure is logged and skipped,
-# never blocking the release. Auto-skips cleanly when the StartOS SDK toolchain
-# is absent (the s9pk build needs start-sdk + deno + yq, unlike the podman-only
-# Umbrel image). On success it writes seeder-launcher/start9/pearcircle-seeder
-# .s9pk (added to the release assets below — it's the target of the website
-# registry's /package/v0/pearcircle-seeder.s9pk redirect) and pins the in-repo
-# start9/ manifest + Dockerfile to the new version for you to commit. The website
-# community registry is refreshed AFTER the GitHub release exists (step 7b).
-# ---------------------------------------------------------------------------
-START9_S9PK=""
-if $SKIP_START9; then
-  echo "==> Skipping StartOS (Start9) s9pk build."
-elif ! command -v start-sdk >/dev/null || ! command -v deno >/dev/null || ! command -v yq >/dev/null; then
-  echo "==> Skipping StartOS s9pk build (StartOS SDK toolchain not found: needs start-sdk + deno + yq)."
-else
-  echo ""
-  echo "==> Building StartOS (Start9) universal s9pk (x86_64 + aarch64, in the background)..."
-  echo "    Full log: /tmp/pearcircle-build-start9.log"
-  if _bg_follow start9 /tmp/pearcircle-build-start9.log \
-       '^==>|^\s*!!|STEP [0-9]+/|Copying (blob|config)|save \+ normalize|packing |verify|s9pk ready|WARNING|[Ee]rror'; then
-    _start9_status=0
-  else
-    _start9_status=$?
-  fi
-  if [ "$_start9_status" -eq 0 ]; then
-    START9_S9PK="$REPO_ROOT/seeder-launcher/start9/pearcircle-seeder.s9pk"
-    echo "    Start9 s9pk OK ($(du -h "$START9_S9PK" | cut -f1)). Log: /tmp/pearcircle-build-start9.log"
-    echo "    In-repo start9/ manifest + Dockerfile pinned to ${RELEASE_TAG#v} — review + commit with the release."
-  else
-    START9_S9PK=""
-    echo "    WARNING: Start9 s9pk build failed, skipping it. Log: /tmp/pearcircle-build-start9.log"
-  fi
-fi
-
-# ---------------------------------------------------------------------------
-# 5e. Generate .sha256 sidecars for the desktop artifacts, then the final gate
-#
-# The desktop, Umbrel and Start9 builds above are slow and best-effort, so
-# their checksums and the last look at the full asset list happen here rather
-# than at step 4e. This is the last confirm before anything irreversible: step
-# 6 commits and step 6b pushes the tag. See RELEASE-PIPELINE.md §2.
-# ---------------------------------------------------------------------------
-for _artifact in "${DESKTOP_ARTIFACTS[@]:-}"; do
-  [ -z "$_artifact" ] && continue
-  [ -f "$_artifact" ] || continue
-  case "$_artifact" in
-    *.sha256|*.yml|*.yaml) continue ;;   # sidecars and update manifests
-  esac
-  [ -f "${_artifact}.sha256" ] && continue          # the builder already made one
-  ( cd "$(dirname "$_artifact")" && sha256sum "$(basename "$_artifact")" > "$(basename "$_artifact").sha256" )
-  echo "    sha256  $(cut -d' ' -f1 < "${_artifact}.sha256")  $(basename "$_artifact")"
-done
-
 echo ""
 _RELEASE_SUMMARY=""
 [ -n "${APK_NAME:-}" ] && _RELEASE_SUMMARY="APK (${APK_SIZE:-?})"
 if $PUBLISH_PLAY && [ -n "${AAB_NAME:-}" ]; then
   _RELEASE_SUMMARY="${_RELEASE_SUMMARY:+$_RELEASE_SUMMARY, }AAB (${AAB_SIZE:-?})"
 fi
-if [ "${#DESKTOP_ARTIFACTS[@]}" -gt 0 ]; then
-  _RELEASE_SUMMARY="${_RELEASE_SUMMARY:+$_RELEASE_SUMMARY, }${#DESKTOP_ARTIFACTS[@]} desktop artifact(s)"
-fi
-[ -n "${START9_S9PK:-}" ] && _RELEASE_SUMMARY="${_RELEASE_SUMMARY:+$_RELEASE_SUMMARY, }Start9 .s9pk"
 [ -z "$_RELEASE_SUMMARY" ] && _RELEASE_SUMMARY="no artifacts"
 _confirm "$_RELEASE_SUMMARY ready to publish?"
 
@@ -1525,8 +1034,6 @@ _confirm "$_RELEASE_SUMMARY ready to publish?"
 if $PUBLISH_GITHUB; then
   _have_upload=false
   [ -n "${APK_NAME:-}" ] && [ -f "$APK_NAME" ] && _have_upload=true
-  [ ${#DESKTOP_ARTIFACTS[@]} -gt 0 ] && _have_upload=true
-  [ -n "${START9_S9PK:-}" ] && [ -f "$START9_S9PK" ] && _have_upload=true
   if ! $_have_upload; then
     echo ""
     echo "==> No artifacts to upload — skipping GitHub release step."
@@ -1550,28 +1057,21 @@ fi
 # ---------------------------------------------------------------------------
 # 6. Commit the version bumps this run made, BEFORE tagging
 # ---------------------------------------------------------------------------
-# Step 0 rewrites app.json + the Xcode project, and the seeder store steps
-# rewrite the Start9 manifest/migrations/Dockerfile pins and the Umbrel
-# manifest/compose pins. Nothing ever committed them, so the tag was cut from a
-# tree still carrying the PREVIOUS version: master permanently declared the
-# version before the one that shipped, and the tag did not contain the version
-# it names.
+# Step 0 rewrites app.json + the Xcode project. Nothing ever committed them,
+# so the tag was cut from a tree still carrying the PREVIOUS version: master
+# permanently declared the version before the one that shipped, and the tag
+# did not contain the version it names.
 #
 # Committing here (before the tag) makes the tag actually contain its version.
 #
 # Explicit allowlist, never `git add -A`. A release run leaves plenty of other
 # dirt in the tree: the .apk/.aab/.sha256 sidecars at the repo root, generated
-# release_notes.md, seeder-launcher/deno.lock. And should assets/*.bundle ever
+# release_notes.md. And should assets/*.bundle ever
 # stop being gitignored, `add -A` would bake a build output that can lag its own
 # source into the release commit.
 _bump_paths=(
   app.json
   "${XCODE_PROJECT:-ios/PearCircle.xcodeproj/project.pbxproj}"
-  seeder-launcher/start9/manifest.yaml
-  seeder-launcher/start9/Dockerfile
-  seeder-launcher/start9/scripts/procedures/migrations.ts
-  seeder-launcher/umbrel/umbrel-app.yml
-  seeder-launcher/umbrel/docker-compose.yml
 )
 _bump_existing=()
 for _p in "${_bump_paths[@]}"; do [ -e "$_p" ] && _bump_existing+=("$_p"); done
@@ -1614,64 +1114,6 @@ git push "$GIT_REMOTE" "$RELEASE_TAG" \
   || echo "    Tag already on remote"
 
 # ---------------------------------------------------------------------------
-# Helper: carry the newest seeder files into a release that did not build them
-#
-# A release that skips some or all seeder builds would otherwise leave
-# releases/latest without those downloads, and the desktop seeders' update
-# check and the website both read releases/latest. For each seeder file kind
-# (macOS .pkg, Windows .exe, Linux .deb and .AppImage per arch, StartOS .s9pk
-# legacy and v2) that is not in <have-name...>, this finds the newest earlier
-# release with that file and a .sha256 sidecar, downloads both into
-# <dest-dir>, checks the hash and prints both paths. Files keep their original
-# names, so a carried 1.1.2 installer still says 1.1.2.
-#
-# GITHUB_API overrides the API base, for the test.
-# Usage: _carry_forward_seeders <token> <slug> <dest-dir> <this-tag> [have-name...]
-# ---------------------------------------------------------------------------
-_carry_forward_seeders() {
-  local token="$1" slug="$2" dest="$3" this_tag="$4"
-  shift 4
-  local api="${GITHUB_API:-https://api.github.com}"
-  [ -z "$slug" ] && return 0
-  local plan
-  plan=$(curl -sL \
-    ${token:+-H "Authorization: Bearer $token"} \
-    -H "Accept: application/vnd.github+json" \
-    "${api}/repos/${slug}/releases" 2>/dev/null \
-    | HAVE="$*" THIS_TAG="$this_tag" python3 -c '
-import json, os, re, sys
-kinds = [r"\.pkg$", r"\.exe$", r"_amd64\.deb$", r"_arm64\.deb$", r"x86_64\.AppImage$",
-         r"aarch64\.AppImage$", r"^pearcircle-seeder\.s9pk$", r"^pearcircle-seeder-v2\.s9pk$"]
-have = os.environ.get("HAVE", "").split()
-try:
-    rels = json.load(sys.stdin)
-except Exception:
-    sys.exit(0)
-for kind in kinds:
-    if any(re.search(kind, h) for h in have):
-        continue
-    for rel in rels:
-        if rel.get("draft") or rel.get("tag_name") == os.environ.get("THIS_TAG"):
-            continue
-        urls = {a.get("name"): a.get("browser_download_url") for a in rel.get("assets", [])}
-        hits = [n for n in urls if n and re.search(kind, n) and urls.get(n + ".sha256")]
-        if hits:
-            print(urls[hits[0]]); print(urls[hits[0] + ".sha256"])
-            break
-' 2>/dev/null) || return 0
-  [ -z "$plan" ] && return 0
-  mkdir -p "$dest"
-  local file_url sum_url name
-  while IFS= read -r file_url && IFS= read -r sum_url; do
-    name=$(basename "$file_url")
-    curl -sfL -o "$dest/$name" "$file_url" || continue
-    curl -sfL -o "$dest/$name.sha256" "$sum_url" || continue
-    ( cd "$dest" && sha256sum -c --status "$name.sha256" ) || continue
-    printf '%s\n%s\n' "$dest/$name" "$dest/$name.sha256"
-  done <<< "$plan"
-}
-
-# ---------------------------------------------------------------------------
 # 7. Create GitHub release and upload assets
 # ---------------------------------------------------------------------------
 echo "==> Creating GitHub release $RELEASE_TAG..."
@@ -1689,7 +1131,7 @@ if $PUBLISH_PLAY && [ -n "$AAB_NAME" ] && [ -f "$AAB_NAME" ]; then
   RELEASE_ASSETS+=("$AAB_NAME")
   [ -f "${AAB_NAME}.sha256" ] && RELEASE_ASSETS+=("${AAB_NAME}.sha256")
 fi
-# A seeder-only release (--skip-android) carries the previous APK forward, so the
+# A release made with --skip-android carries the previous APK forward, so the
 # releases/latest page the website links to still has the Android app on it.
 if $SKIP_ANDROID; then
   _CARRIED=$(_carry_forward_apk "$GH_TOKEN" "$REPO_SLUG" "$(mktemp -d)")
@@ -1699,44 +1141,6 @@ if $SKIP_ANDROID; then
   else
     echo "==> WARNING: no APK carried forward - this release will have no Android download."
   fi
-fi
-# Desktop seeder-launcher installers from step 4d (best-effort; empty when
-# --skip-desktop was passed or every platform failed to build).
-for _d in "${DESKTOP_ARTIFACTS[@]}"; do
-  RELEASE_ASSETS+=("$_d")
-  [ -f "${_d}.sha256" ] && RELEASE_ASSETS+=("${_d}.sha256")
-done
-# StartOS .s9pk from step 5d (best-effort). Uploaded under the tag so the
-# website registry's /package/v0/pearcircle-seeder.s9pk redirect resolves.
-if [ -n "${START9_S9PK:-}" ] && [ -f "$START9_S9PK" ]; then
-  # The legacy 0.3.5 package only when the pre-flight opted in.
-  if ! $SKIP_START9_LEGACY; then
-    RELEASE_ASSETS+=("$START9_S9PK")
-    [ -f "${START9_S9PK}.sha256" ] && RELEASE_ASSETS+=("${START9_S9PK}.sha256")
-  fi
-  # The v2 package for StartOS 0.4.0+, converted from the v1 above by the same
-  # build script. 0.4.0's web UI refuses a v1 s9pk on a magic-byte check, so
-  # without this asset a 0.4.0 user has to fall back to the CLI to sideload.
-  # Absent when the build machine lacks the 0.4.x start-cli or a packaging
-  # workspace, which that script says loudly.
-  _s9pk_v2="${START9_S9PK%.s9pk}-v2.s9pk"
-  if [ -f "$_s9pk_v2" ]; then
-    RELEASE_ASSETS+=("$_s9pk_v2")
-    [ -f "${_s9pk_v2}.sha256" ] && RELEASE_ASSETS+=("${_s9pk_v2}.sha256")
-  elif $SKIP_START9_LEGACY; then
-    echo "==> WARNING: no v2 s9pk and the legacy one was skipped - this release has no StartOS package."
-  fi
-fi
-# Seeder files this run didn't build come forward from the newest earlier
-# release that has each one, so releases/latest always offers every seeder
-# download. They keep their names, and with them their versions.
-_HAVE=()
-for _a in "${RELEASE_ASSETS[@]}"; do _HAVE+=("$(basename "$_a")"); done
-_SEEDERS=$(_carry_forward_seeders "$GH_TOKEN" "$REPO_SLUG" "$(mktemp -d)" "$RELEASE_TAG" "${_HAVE[@]}")
-if [ -n "$_SEEDERS" ]; then
-  while IFS= read -r _c; do RELEASE_ASSETS+=("$_c"); done <<< "$_SEEDERS"
-  echo "==> Carrying forward seeder files this release did not build:"
-  printf '%s\n' "$_SEEDERS" | grep -v '\.sha256$' | while IFS= read -r _c; do echo "    - $(basename "$_c")"; done
 fi
 echo ""
 echo "    Repo   : ${REPO_SLUG:-unknown}"
@@ -1753,7 +1157,6 @@ _asset_content_type() {
   case "$1" in
     *.apk)    echo "application/vnd.android.package-archive" ;;
     *.aab)    echo "application/octet-stream" ;;
-    *.s9pk)   echo "application/octet-stream" ;;
     *.sha256) echo "text/plain" ;;
     *)        echo "application/octet-stream" ;;
   esac
@@ -1927,32 +1330,6 @@ else
   gh release create "$RELEASE_TAG" "${RELEASE_ASSETS[@]}" \
     --title "$RELEASE_TAG" \
     --notes-file release_notes.md
-fi
-
-# ---------------------------------------------------------------------------
-# 7b. Refresh the StartOS community registry on the website
-#
-# Runs only after the release + s9pk asset are live (above), because the
-# registry metadata advertises this version and _redirects points at this tag's
-# asset. Gated on WEBSITE_DIR and a successful Start9 build (START9_S9PK).
-# Best-effort. With WEBSITE_REGISTRY_PR=1 it commits, pushes a branch, and
-# opens + squash-merges the website PR (Cloudflare deploys on merge to main);
-# otherwise it regenerates the files and prints the git/gh commands to run.
-#   WEBSITE_DIR          dedicated clone of the website repo
-#   WEBSITE_REGISTRY_PR  1 = auto commit + PR + merge (deploy); else print steps
-# ---------------------------------------------------------------------------
-if [ -n "${START9_S9PK:-}" ] && [ -f "$START9_S9PK" ] && [ -n "${WEBSITE_DIR:-}" ]; then
-  echo ""
-  echo "==> Refreshing StartOS community registry on the website..."
-  if S9PK="$START9_S9PK" WEBSITE_DIR="$WEBSITE_DIR" SKIP_LEGACY="$SKIP_START9_LEGACY" \
-     WEBSITE_REGISTRY_PR="${WEBSITE_REGISTRY_PR:-}" \
-       bash "$REPO_ROOT/seeder-launcher/scripts/publish-start9-registry.sh" "${RELEASE_TAG#v}"; then
-    :
-  else
-    echo "    WARNING: registry publish step failed — refresh the website registry manually."
-  fi
-elif [ -n "${START9_S9PK:-}" ] && [ -z "${WEBSITE_DIR:-}" ]; then
-  echo "    (StartOS registry not refreshed — set WEBSITE_DIR to a website clone, and WEBSITE_REGISTRY_PR=1 to auto-deploy.)"
 fi
 
 else
@@ -2906,68 +2283,4 @@ if $APP_STORE_DEFERRED; then
   echo "      asc review submissions-create --app $ASC_APP_ID --platform IOS"
   echo "      asc review items-add --submission <SID> --item-type appStoreVersions --item-id <VID>"
   echo "      asc review submissions-submit --id <SID> --confirm"
-fi
-# ---------------------------------------------------------------------------
-# 13c. Community app store gate
-#
-# The PeerLoom community store served 1.0.19 for SEVEN releases. Not because
-# anything failed - because step 5c bumps the manifests in $UMBREL_STORE_DIR
-# and then prints "commit + push that repo to publish", and that line scrolls
-# past in a long release log. Every release since 1.0.19 missed it, so anyone
-# installing the seeder from that store got a build weeks old.
-#
-# This is the third silent-manual-step in this pipeline (missing seeder build
-# scripts #113, the Umbrel publish env gate 2026-06-30, this), so the fix is
-# aimed at the shape rather than the instance: a release that leaves the store
-# unpublished now EXITS NON-ZERO. An instruction can be walked past; a failed
-# release cannot.
-#
-# Deliberately last, and deliberately not fatal earlier: everything above has
-# already succeeded and must not be rolled back. This only refuses to call the
-# run clean.
-#
-# Two distinct traps are checked, because both have actually happened:
-#   1. uncommitted bumps  - the manifests were edited but never committed
-#   2. wrong branch       - the clone was sitting on a feature branch
-#                           (`add-peartune`), so even committing in place would
-#                           not publish; the store serves its default branch
-# ---------------------------------------------------------------------------
-if [ -n "${UMBREL_STORE_DIR:-}" ] && [ -d "${UMBREL_STORE_DIR}/.git" ]; then
-  _store_dirty=$(git -C "$UMBREL_STORE_DIR" status --porcelain -- '*pearcircle-seeder*' 2>/dev/null)
-  _store_branch=$(git -C "$UMBREL_STORE_DIR" rev-parse --abbrev-ref HEAD 2>/dev/null)
-  # The branch the store actually serves, straight from the remote rather than
-  # assumed to be "master" - it differs between forks.
-  _store_default=$(git -C "$UMBREL_STORE_DIR" symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null | sed 's|^origin/||')
-  _store_default="${_store_default:-master}"
-
-  if [ -n "$_store_dirty" ]; then
-    echo ""
-    echo "=========================================================================="
-    echo "  RELEASE INCOMPLETE: the community app store was NOT published"
-    echo "=========================================================================="
-    echo ""
-    echo "  $UMBREL_STORE_DIR has uncommitted PearCircle seeder changes, so the"
-    echo "  store still serves the PREVIOUS version. Users installing from it will"
-    echo "  not get $RELEASE_TAG."
-    echo ""
-    echo "$_store_dirty" | sed 's/^/      /'
-    echo ""
-    if [ "$_store_branch" != "$_store_default" ]; then
-      echo "  Also: that clone is on branch '$_store_branch', but the store serves"
-      echo "  '$_store_default'. Committing in place would still not publish."
-      echo "  Move the seeder changes onto a branch cut from origin/$_store_default."
-      echo ""
-    fi
-    echo "  Everything else in this release succeeded and is live. Publish the"
-    echo "  store, then this is done."
-    echo ""
-    exit 1
-  fi
-
-  if [ "$_store_branch" != "$_store_default" ]; then
-    echo ""
-    echo "    NOTE: $UMBREL_STORE_DIR is on '$_store_branch', not the store's"
-    echo "    '$_store_default'. Nothing uncommitted, so this release is fine, but"
-    echo "    a future bump made on this branch would not publish."
-  fi
 fi

@@ -1,7 +1,7 @@
-// A seeder-only release (--skip-android) carries the previous release's APK forward.
+// A release made with --skip-android carries the previous release's APK forward.
 //
 // The website sends people to releases/latest for the Android app, and the release script
-// only uploads what it built in that run. So a release cut just to ship a seeder fix
+// only uploads what it built in that run. So a release without its own APK
 // would have left the latest release with no APK at all. The helper is
 // run for real here, against a fake GitHub served from file:// URLs.
 
