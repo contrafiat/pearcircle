@@ -21,6 +21,10 @@
 //                               the per-circle Autobase is the canonical
 //                               cross-peer record.
 
+// Fix hypercore's crash after a flush before any core opens
+// (see lib/hypercoreSnapshotPatch.js).
+require('./lib/hypercoreSnapshotPatch').applySnapshotFlushFix(require('hypercore/lib/session-state'))
+
 const Corestore = require('corestore')
 const Hyperbee = require('hyperbee')
 const Hyperswarm = require('hyperswarm')
