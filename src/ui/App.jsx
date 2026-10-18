@@ -2961,9 +2961,9 @@ function HomeMapView ({ identity, profile, sharing, tileStyleUrl, setView, setSh
             sits at the country-level US default; dim it and label the empty
             state instead of showing a bare map. pointer-events:none keeps it
             purely visual. Clears the instant any pin appears. */}
-        {Object.keys(data.lastSeen || {}).length === 0 && (
+        {Object.keys(data.lastSeen || {}).length === 0 && !(WATCH_ONLY && circles.length === 0) && (
           <div style={s.mapWaiting}>
-            <span style={s.mapWaitingText}>Getting your location…</span>
+            <span style={s.mapWaitingText}>{WATCH_ONLY ? 'Waiting for member locations…' : 'Getting your location…'}</span>
           </div>
         )}
       </div>

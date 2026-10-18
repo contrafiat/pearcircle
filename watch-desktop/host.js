@@ -20,28 +20,43 @@ const { spawn } = require('node:child_process')
 const { WebSocketServer } = require('ws')
 const { Worklet } = require('../seeder-launcher/host/worklet.js')
 
-// Two layouts. Packaged (AppImage / .deb, built by scripts/build-linux.sh):
-// host-bundled.js sits next to bare, worklet/worklet.bundle and ui/. From a
-// checkout: this file is in watch-desktop/ and everything comes from the repo.
+// Two layouts. Packaged (built by scripts/build-*.sh): host-bundled.js sits
+// next to bare, worklet/worklet.bundle and ui/. From a checkout: this file is
+// in watch-desktop/ and everything comes from the repo.
 const PACKAGED = fs.existsSync(path.join(__dirname, 'worklet', 'worklet.bundle'))
 const ROOT = PACKAGED ? __dirname : path.resolve(__dirname, '..')
+const EXE = process.platform === 'win32' ? '.exe' : ''
 const PATHS = PACKAGED
   ? {
-      bare: path.join(ROOT, 'bare'),
+      bare: path.join(ROOT, 'bare' + EXE),
       bundle: path.join(ROOT, 'worklet', 'worklet.bundle'),
       indexHtml: path.join(ROOT, 'ui', 'index.html'),
       uiBundle: path.join(ROOT, 'ui', 'app-ui.bundle'),
     }
   : {
-      bare: path.join(ROOT, 'node_modules', 'bare-runtime-linux-x64', 'bin', 'bare'),
+      bare: path.join(ROOT, 'node_modules', 'bare-runtime-' + process.platform + '-' + process.arch, 'bin', 'bare' + EXE),
       bundle: path.join(ROOT, 'src', 'bare.js'),
       indexHtml: path.join(ROOT, 'src', 'ui', 'index.html'),
       uiBundle: path.join(ROOT, 'assets', 'app-ui.bundle'),
     }
 
+function defaultDataDir () {
+  if (process.platform === 'win32') return path.join(process.env.LOCALAPPDATA || path.join(os.homedir(), 'AppData', 'Local'), 'PearCircle Watcher')
+  if (process.platform === 'darwin') return path.join(os.homedir(), 'Library', 'Application Support', 'PearCircle Watcher')
+  return path.join(os.homedir(), '.local', 'share', 'pearcircle-watch')
+}
+
+// The default browser. On Windows, `start` would need cmd quoting, so use
+// the URL handler directly.
+function openCommand (link) {
+  if (process.platform === 'win32') return ['rundll32', ['url.dll,FileProtocolHandler', link]]
+  if (process.platform === 'darwin') return ['open', [link]]
+  return ['xdg-open', [link]]
+}
+
 function parseArgs (argv) {
   const out = {
-    dataDir: path.join(os.homedir(), '.local', 'share', 'pearcircle-watch'),
+    dataDir: defaultDataDir(),
     port: 8743,
     label: os.hostname().slice(0, 40),
     bare: PATHS.bare,
@@ -120,7 +135,8 @@ async function main () {
   fs.mkdirSync(opts.dataDir, { recursive: true })
   const openLink = (link) => {
     if (!opts.open) return
-    try { spawn('xdg-open', [link], { stdio: 'ignore', detached: true }).unref() } catch {}
+    const [cmd, args] = openCommand(link)
+    try { spawn(cmd, args, { stdio: 'ignore', detached: true }).unref() } catch {}
   }
   const tokenPath = path.join(opts.dataDir, 'auth.token')
   let token
