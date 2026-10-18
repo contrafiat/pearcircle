@@ -58,7 +58,7 @@ const { summarizeSeederCoverage } = require('./lib/seederCoverage')
 const { revocationNoticeFor, recordRevocationNotice, clearRevocationNotice, loadRevokedCircles } = require('./lib/seederRevocation')
 const { circleIsDeleted, memberHiddenByLeft, memberHiddenByRemoved, shouldAcceptRemovedRow, shouldRecoverFromTombstone } = require('./lib/circleFilter')
 const { memberHiddenByHide, memberLastActiveAt, canHideMember, shouldAcceptHiddenRow } = require('./lib/memberHide')
-const { shouldAcceptWatcherRow, shouldAcceptWatcherRemovedRow, watcherActive, checkWatcherHello } = require('./lib/watcher')
+const { shouldAcceptWatcherRow, shouldAcceptWatcherRemovedRow, watcherActive, checkWatcherHello, normalizeWatcherLabel } = require('./lib/watcher')
 const { liveRecipientSet } = require('./lib/liveRecipients')
 const accountBackup = require('./lib/accountBackup')
 const { OWNER_V2_CAP, activeCoowners, isAuthorized, hasOwnerV2Cap, circleOwnerV2Ready, shouldAcceptCircleRow, shouldAcceptSignedRemovedRow, shouldAcceptCoownerRow } = require('./lib/ownerAuth')
@@ -222,6 +222,15 @@ let _initialized = false
 // mode is fixed at process launch and not mixable).
 let _activeHandlers = null
 let _seedMode = false
+// Watch-only desktop (proposal 2026-10-18-watch-only-client): member-mode IPC,
+// but the worklet never becomes a writer. It sends a watcherHello on each
+// circle's pair channel until a member writes its watcher: row. Set by init
+// { mode: 'watch' }; _watchLabel is the name members see.
+let _watchMode = false
+let _watchLabel = 'Desktop watcher'
+// circleId -> 'pending' | 'active' | 'removed', from our own watcher: and
+// watcherRemoved: rows. Watch mode only.
+const _watchStatus = new Map()
 // Seeder build version, passed in by the launcher host at init (proposal
 // 2026-06-05-seeder-update slice 1). Reported via seeder:status and announced
 // to members so the app can surface "update available". null when unknown.
@@ -4298,6 +4307,7 @@ function invalidateCircleView (circleId) {
   _viewGen.set(circleId, (_viewGen.get(circleId) || 0) + 1)
   _viewSnapshotCache.delete(circleId)
   if (_liveRecipients.has(circleId)) scheduleLiveRecipientsRefresh(circleId)
+  if (_watchMode) scheduleWatchStatusRefresh(circleId)
 }
 
 // Read (and cache) the view-derived part of a circle snapshot. Pure reads off
@@ -4447,6 +4457,9 @@ async function snapshotCircle (circleId, base) {
   // freshest of the three. Restricted to visible members so a stale entry for a
   // left/removed member (already filtered out of `members`) can't reappear.
   const allowedMemberKeys = new Set(v.members.map((m) => m.value?.pubkey).filter(Boolean))
+  // Re-check on each poll until a member has added us, in case the apply that
+  // brought our row in was read too early.
+  if (_watchMode && _watchStatus.get(circleId) !== 'active') refreshWatchStatus(circleId).catch(() => {})
   // Kick a background refresh of peers' last-known cores; the result lands in
   // the cache for a later poll (slice 2a). Non-blocking — never awaited here.
   refreshPeerLastKnown(circleId).catch(() => {})
@@ -4461,6 +4474,8 @@ async function snapshotCircle (circleId, base) {
     transitions: v.transitions,
     supersedes: v.supersedes,
     watchers: v.watchers,
+    // Watch mode only: whether a member has added this desktop yet.
+    watchStatus: _watchMode ? (_watchStatus.get(circleId) || 'pending') : undefined,
     writable: base.writable,
     writers: base.writers ? base.writers.length : null,
     // True once an append to this circle timed out (wedged local Autobase);
@@ -6166,8 +6181,6 @@ function registerLiveNotify (conn) {
 // The desktop re-sends its hello every few seconds until its row lands, so
 // _watcherHelloInFlight stops us appending the same row more than once.
 const _watcherHelloInFlight = new Set()
-// True when this worklet runs as the watch-only desktop (slice 4 sets it).
-let _watchMode = false
 async function handleWatcherHello (circleId, msg, remotePublicKey) {
   const base = _circleBases.get(circleId)
   if (!base || !base.writable || !_identity) return
@@ -6202,9 +6215,46 @@ async function handleWatcherHello (circleId, msg, remotePublicKey) {
 }
 
 // Pair-channel options for the watcher flow, shared by every setupPairChannel
-// call site.
+// call site. In watch mode we send a hello (in place of the writerHello) until
+// our watcher: row lands or a member removes us.
 function watcherPairOpts (circleId) {
-  return { onWatcherHello: (msg, remote) => handleWatcherHello(circleId, msg, remote) }
+  const opts = { onWatcherHello: (msg, remote) => handleWatcherHello(circleId, msg, remote) }
+  if (_watchMode) {
+    opts.getWatcherHello = () => {
+      if ((_watchStatus.get(circleId) || 'pending') !== 'pending') return null
+      return { pubkey: b4a.toString(_identity.publicKey, 'hex'), label: _watchLabel }
+    }
+  }
+  return opts
+}
+
+// Called from invalidateCircleView, which runs at the end of an apply pass,
+// before that pass's writes are readable from base.view. Wait a moment, the
+// same as the live-recipient rebuild.
+const _watchStatusPending = new Set()
+function scheduleWatchStatusRefresh (circleId) {
+  if (_watchStatusPending.has(circleId)) return
+  _watchStatusPending.add(circleId)
+  const t = setTimeout(() => {
+    _watchStatusPending.delete(circleId)
+    refreshWatchStatus(circleId).catch(() => {})
+  }, LIVE_RECIPIENTS_DEBOUNCE_MS)
+  if (typeof t.unref === 'function') t.unref()
+}
+
+// Watch mode: re-read our own watcher rows for a circle and tell the UI when
+// the status changes.
+async function refreshWatchStatus (circleId) {
+  const base = _circleBases.get(circleId)
+  if (!base || !_identity) return
+  const pk = b4a.toString(_identity.publicKey, 'hex')
+  const addedTs = (await base.view.get('watcher:' + pk).catch(() => null))?.value?.ts
+  const removedTs = (await base.view.get('watcherRemoved:' + pk).catch(() => null))?.value?.ts
+  const status = watcherActive(addedTs, removedTs) ? 'active' : typeof removedTs === 'number' ? 'removed' : 'pending'
+  if (_watchStatus.get(circleId) === status) return
+  _watchStatus.set(circleId, status)
+  mark('watch:status', { cid: circleId.slice(0, 8), status })
+  send({ event: 'watch:status', data: { circleId, status } })
 }
 
 // Verify + gate a received live position, then store the freshest per member.
@@ -8100,7 +8150,12 @@ function startStoreCompactTimer () {
   _storeCompactTimer = setInterval(() => { compactStore('interval') }, STORE_COMPACT_INTERVAL_MS)
 }
 
-async function init ({ dataDir, mode, version } = {}, attempt = 0) {
+async function init ({ dataDir, mode, version, label } = {}, attempt = 0) {
+  if (mode === 'watch') {
+    _watchMode = true
+    const l = normalizeWatcherLabel(label)
+    if (l) _watchLabel = l
+  }
   if (typeof version === 'string' && version.length > 0) _seederVersion = version.slice(0, 64)
   if (_initialized) {
     const pubkey = _seedMode
