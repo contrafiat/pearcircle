@@ -4,6 +4,23 @@ Shows a circle's members on a map from a computer. It never shares a location
 and is not listed as a member. Members see it under Watching in Settings >
 Circles and can remove it. Design: `proposals/2026-10-18-watch-only-client.md`.
 
+## Install it (Linux x86_64)
+
+Build the packages:
+
+```
+bash watch-desktop/scripts/build-linux.sh 0.1.0
+```
+
+That writes `watch-desktop/dist/PearCircleWatch-x86_64.AppImage` (any distro,
+run it directly) and `watch-desktop/dist/pearcircle-watch_0.1.0_amd64.deb`
+(Debian / Ubuntu). Each bundles Node, the bare runtime and the native addons,
+so nothing else needs installing.
+
+Launching it again while it runs just reopens the page. When it opened the
+browser itself, it quits a minute after the last tab closes. With
+`--no-open` it keeps running.
+
 ## Run it (Linux, from a checkout)
 
 ```
