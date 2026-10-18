@@ -1,6 +1,6 @@
 # Watch-only desktop client
 
-**Status**: Approved 2026-10-18 by Tim, with open questions 1-3 resolved as proposed: any member can make a watch invite, every member is notified when a watcher is added, and v1 shows positions only (no trips). Question 4 (Linux only for v1) is still open.
+**Status**: Approved 2026-10-18 by Tim, with open questions 1-3 resolved as proposed: any member can make a watch invite, every member is notified when a watcher is added and v1 shows positions only (no trips). Question 4 (Linux only for v1) is still open.
 
 **Goal**: A desktop app that joins a circle and shows members on the map, the same as a phone. It never shares a location and does not appear in the member list. Every member can see that a watcher exists in a separate "Watching" list and can remove it.
 
