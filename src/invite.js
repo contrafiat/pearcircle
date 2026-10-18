@@ -41,9 +41,13 @@ const NAME_MAX = 64
  *   key. Required for circles created post 2026-05-19; omit for legacy
  *   unencrypted circles.
  * @param {'https'|'pear'} [args.scheme='https']
+ * @param {'member'|'watch'} [args.role='member'] - 'watch' marks a watch
+ *   invite for the desktop watcher (proposal 2026-10-18-watch-only-client).
+ *   Same keys as a member invite, the flag only tells the joining app to join
+ *   as a watcher. Older apps ignore it and join as a member.
  * @returns {string}
  */
-function buildInvite ({ circleId, name, circleKey, bootstrap, inviterPublicKey, encryptionKey, scheme = 'https' }) {
+function buildInvite ({ circleId, name, circleKey, bootstrap, inviterPublicKey, encryptionKey, scheme = 'https', role = 'member' }) {
   if (typeof circleId !== 'string' || !BASE64URL_43.test(circleId)) {
     throw new Error('circleId must be a 43-char base64url string (32 bytes)')
   }
@@ -67,6 +71,9 @@ function buildInvite ({ circleId, name, circleKey, bootstrap, inviterPublicKey, 
   if (scheme !== 'https' && scheme !== 'pear') {
     throw new Error('scheme must be "https" or "pear"')
   }
+  if (role !== 'member' && role !== 'watch') {
+    throw new Error('role must be "member" or "watch"')
+  }
 
   const base = scheme === 'pear' ? PEAR_HOST_PATH : HTTPS_HOST_PATH
   const params = [
@@ -77,13 +84,14 @@ function buildInvite ({ circleId, name, circleKey, bootstrap, inviterPublicKey, 
     `inviter=${inviterPublicKey}`,
   ]
   if (encryptionKey) params.push(`enc=${encryptionKey}`)
+  if (role === 'watch') params.push('role=watch')
   return `${base}?${params.join('&')}`
 }
 
 /**
  * Parse an invite link.
  * @param {string} url
- * @returns {{ ok: boolean, scheme?: 'https'|'pear', circleId?: string, name?: string, circleKey?: string, bootstrap?: string, inviterPublicKey?: string, encryptionKey?: string|null, error?: string }}
+ * @returns {{ ok: boolean, scheme?: 'https'|'pear', circleId?: string, name?: string, circleKey?: string, bootstrap?: string, inviterPublicKey?: string, encryptionKey?: string|null, role?: 'member'|'watch', error?: string }}
  */
 // Tolerate a trailing slash before the query (e.g. ".../circle/join/?circle=..."),
 // which the app's own share links and some browsers/share sheets emit. The
@@ -140,8 +148,11 @@ function parseInvite (url) {
     }
     encryptionKey = encRaw
   }
+  // An unknown role is treated as a member invite, so a future role an older
+  // parser doesn't know still joins the way it always did.
+  const role = params.role === 'watch' ? 'watch' : 'member'
 
-  return { ok: true, scheme, circleId, name, circleKey, bootstrap, inviterPublicKey, encryptionKey }
+  return { ok: true, scheme, circleId, name, circleKey, bootstrap, inviterPublicKey, encryptionKey, role }
 }
 
 /**

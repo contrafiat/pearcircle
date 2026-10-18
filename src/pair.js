@@ -8,6 +8,12 @@
 // { type: 'addWriter', pubkey } to the per-circle Autobase, which the apply
 // branch turns into a base.addWriter call. Replication then flips the
 // joiner's base.writable to true.
+//
+// A watch-only desktop (proposal 2026-10-18-watch-only-client) sends a
+// watcherHello { pubkey, label } in place of the writerHello and never
+// becomes a writer. A member hands it to onWatcherHello, which writes the
+// watcher: row. Older peers ignore the second message type (protomux drops
+// message types it doesn't know).
 
 const Protomux = require('protomux')
 const c = require('compact-encoding')
@@ -21,16 +27,33 @@ const HEX_64 = /^[0-9a-f]{64}$/i
 // the new key to get re-admitted — otherwise the device stays read-only.
 const PAIR_HELLO_RETRY_MS = 5000
 
-function setupPairChannel ({ conn, circleId, base, onWriterAdded, mark }) {
+function setupPairChannel ({ conn, circleId, base, onWriterAdded, getWatcherHello, onWatcherHello, mark }) {
   const mux = Protomux.from(conn)
   let writerHello
+  let watcherHello
   let helloTimer = null
   const addedWriters = new Set() // writer keys already addWriter'd on this channel (idempotency)
   const cidShort = circleId.slice(0, 8)
   const trace = (name, extra) => { if (typeof mark === 'function') try { mark(name, { cid: cidShort, ...(extra || {}) }) } catch {} }
 
   const stopHelloRetry = () => { if (helloTimer) { clearInterval(helloTimer); helloTimer = null } }
+  // Watcher side: getWatcherHello returns the hello to send, or null once
+  // our watcher: row has landed.
+  const watcherHelloValue = () => (typeof getWatcherHello === 'function' ? getWatcherHello() : null)
+  const wantsHello = () => (typeof getWatcherHello === 'function' ? !!watcherHelloValue() : !base.writable)
   const sendHello = () => {
+    if (typeof getWatcherHello === 'function') {
+      const hello = watcherHelloValue()
+      if (!hello || !watcherHello) return false
+      try {
+        watcherHello.send(hello)
+        trace('pair:watcher-hello-sent')
+        return true
+      } catch (e) {
+        trace('pair:watcher-hello-send-failed', { err: e?.message ?? String(e) })
+        return false
+      }
+    }
     if (base.writable || !base.local || !writerHello) return false
     try {
       writerHello.send({ writerKey: b4a.toString(base.local.key, 'hex') })
@@ -50,9 +73,9 @@ function setupPairChannel ({ conn, circleId, base, onWriterAdded, mark }) {
       // Both sides matched. If we are not yet a writer, advertise our key and
       // keep re-advertising until we become one (or the channel closes).
       sendHello()
-      if (!base.writable && !helloTimer) {
+      if (wantsHello() && !helloTimer) {
         helloTimer = setInterval(() => {
-          if (base.writable) { stopHelloRetry(); return }
+          if (!wantsHello()) { stopHelloRetry(); return }
           sendHello()
         }, PAIR_HELLO_RETRY_MS)
         if (typeof helloTimer.unref === 'function') helloTimer.unref()
@@ -83,6 +106,21 @@ function setupPairChannel ({ conn, circleId, base, onWriterAdded, mark }) {
       } catch (e) {
         addedWriters.delete(msg.writerKey) // allow a retry on the next hello
         trace('pair:addwriter-failed', { err: e?.message ?? String(e) })
+      }
+    },
+  })
+
+  watcherHello = channel.addMessage({
+    encoding: c.json,
+    onmessage: async (msg) => {
+      trace('pair:watcher-hello-received', { writable: !!base.writable })
+      // Only writers can write the watcher: row.
+      if (!base.writable || typeof onWatcherHello !== 'function') return
+      const remote = conn.remotePublicKey ? b4a.toString(conn.remotePublicKey, 'hex') : null
+      try {
+        await onWatcherHello(msg, remote)
+      } catch (e) {
+        trace('pair:watcher-add-failed', { err: e?.message ?? String(e) })
       }
     },
   })
