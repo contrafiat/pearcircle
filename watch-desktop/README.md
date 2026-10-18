@@ -11,8 +11,8 @@ runtime and the native addons, so nothing else needs installing.
 
 | Platform | Command | Output in `watch-desktop/dist/` |
 | --- | --- | --- |
-| Linux x86_64 | `bash watch-desktop/scripts/build-linux.sh 0.1.0` | `PearCircleWatch-x86_64.AppImage`, `pearcircle-watch_0.1.0_amd64.deb` |
-| Linux arm64 | `LINUX_ARCH=arm64 bash watch-desktop/scripts/build-linux.sh 0.1.0` | `PearCircleWatch-aarch64.AppImage`, `pearcircle-watch_0.1.0_arm64.deb` |
+| Linux x86_64 | `bash watch-desktop/scripts/build-linux.sh 0.1.0` | `PearCircleWatcher-0.1.0-x86_64.AppImage`, `pearcircle-watch_0.1.0_amd64.deb` |
+| Linux arm64 | `LINUX_ARCH=arm64 bash watch-desktop/scripts/build-linux.sh 0.1.0` | `PearCircleWatcher-0.1.0-aarch64.AppImage`, `pearcircle-watch_0.1.0_arm64.deb` |
 | Windows x64 | `bash watch-desktop/scripts/build-windows.sh 0.1.0` | `PearCircleWatcher-Setup-0.1.0.exe` |
 | macOS | `bash watch-desktop/scripts/build-macos.sh 0.1.0` | `PearCircleWatcher-0.1.0-arm64.dmg` |
 
@@ -26,6 +26,10 @@ runtime and the native addons, so nothing else needs installing.
   and its data is in `~/Library/Application Support/PearCircle Watcher`.
 
 `scripts/stage-payload.sh` holds the steps the three scripts share.
+
+`scripts/release.sh` builds all of them in the background and attaches them
+to the GitHub release. With `--skip-desktop`, or if every build fails, the
+release carries the previous release's installers forward.
 
 Launching it again while it runs just reopens the page. When it opened the
 browser itself, it quits a minute after the last tab closes. With

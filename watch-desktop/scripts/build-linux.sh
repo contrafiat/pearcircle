@@ -13,7 +13,7 @@
 # appimagetool, the AppImage runtime) are cached in seeder-launcher/dist/cache,
 # shared with the seeder build.
 #
-# Output: watch-desktop/dist/PearCircleWatch-<x86_64|aarch64>.AppImage and
+# Output: watch-desktop/dist/PearCircleWatcher-<version>-<x86_64|aarch64>.AppImage and
 #         watch-desktop/dist/pearcircle-watch_<version>_<amd64|arm64>.deb
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -95,7 +95,7 @@ desktop_entry "pearcircle-watch" > "$APPDIR/pearcircle-watch.desktop"
 cp "$REPO/assets/images/icon.png" "$APPDIR/pearcircle-watch.png"
 cp "$REPO/assets/images/icon.png" "$APPDIR/.DirIcon"
 
-APPIMAGE="$DIST/PearCircleWatch-$AI_ARCH.AppImage"
+APPIMAGE="$DIST/PearCircleWatcher-${VERSION}-$AI_ARCH.AppImage"
 rm -f "$APPIMAGE"
 echo "--> appimagetool"
 ARCH=$AI_ARCH VERSION="$VERSION" "$APPIMAGETOOL" --appimage-extract-and-run --runtime-file "$RUNTIME" "$APPDIR" "$APPIMAGE" >/dev/null 2>&1

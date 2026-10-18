@@ -17,8 +17,12 @@ stage_payload () {
   rm -rf "$out"
   mkdir -p "$out/worklet" "$out/ui"
 
-  echo "--> ui bundle"
-  ( cd "$REPO" && npm run --silent build:ui )
+  # The release script builds the UI bundle once and sets WATCH_SKIP_UI_BUILD=1.
+  if [ "${WATCH_SKIP_UI_BUILD:-0}" != 1 ]; then
+    echo "--> ui bundle"
+    ( cd "$REPO" && npm run --silent build:ui )
+  fi
+  [ -s "$REPO/assets/app-ui.bundle" ] || { echo "assets/app-ui.bundle is missing" >&2; return 1; }
   cp "$REPO/src/ui/index.html" "$out/ui/index.html"
   cp "$REPO/assets/app-ui.bundle" "$out/ui/app-ui.bundle"
 

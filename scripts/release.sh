@@ -12,6 +12,8 @@
 #                      a GitHub release re-attaches the previous APK)
 #   --skip-ios         Skip iOS App Store build
 #   --skip-mobile      Skip both Android and iOS builds (shorthand)
+#   --skip-desktop     Skip the desktop watcher installers (a GitHub release
+#                      then carries the previous ones forward)
 #
 # Required env vars (or set in scripts/.env):
 #   KEYSTORE_PASSWORD            - release keystore password
@@ -113,6 +115,44 @@ _bg_cleanup() {
   rm -rf "$_BG_DIR"
 }
 trap _bg_cleanup EXIT
+
+# ---------------------------------------------------------------------------
+# Helper: carry the desktop watcher installers forward from the latest release
+# The website links to releases/latest for the watcher, so a release that
+# skips the watcher builds re-attaches the previous ones. Fetches every
+# PearCircleWatcher-* and pearcircle-watch_* asset that has a .sha256 sidecar
+# into <dest-dir>, checks each hash and prints the paths of the files and
+# their sidecars. Files keep their versioned names.
+# Usage: _carry_forward_watcher <token> <slug> <dest-dir>
+# ---------------------------------------------------------------------------
+_carry_forward_watcher() {
+  local token="$1" slug="$2" dest="$3"
+  local api="${GITHUB_API:-https://api.github.com}"
+  [ -z "$slug" ] && return 0
+  local pairs
+  pairs=$(curl -sL \
+    ${token:+-H "Authorization: Bearer $token"} \
+    -H "Accept: application/vnd.github+json" \
+    "${api}/repos/${slug}/releases/latest" 2>/dev/null \
+    | python3 -c "
+import sys, json
+d = json.load(sys.stdin)
+names = {a.get('name'): a.get('browser_download_url') for a in d.get('assets', [])}
+for n in sorted(names):
+    if n and (n.startswith('PearCircleWatcher-') or n.startswith('pearcircle-watch_')) and not n.endswith('.sha256') and names.get(n + '.sha256'):
+        print(names[n] + ' ' + names[n + '.sha256'])
+" 2>/dev/null) || return 0
+  [ -z "$pairs" ] && return 0
+  mkdir -p "$dest"
+  local url sum name
+  while read -r url sum; do
+    name=$(basename "$url")
+    curl -sfL -o "$dest/$name" "$url" || continue
+    curl -sfL -o "$dest/$name.sha256" "$sum" || continue
+    ( cd "$dest" && sha256sum -c --status "$name.sha256" ) || continue
+    printf '%s\n%s\n' "$dest/$name" "$dest/$name.sha256"
+  done <<< "$pairs"
+}
 
 # ---------------------------------------------------------------------------
 # Helper: does the latest GitHub release carry an APK built for its own version?
@@ -217,6 +257,7 @@ SKIP_PLAY=false
 SKIP_NOSTR=false
 SKIP_ANDROID=false
 SKIP_IOS=false
+SKIP_DESKTOP=false
 
 for arg in "$@"; do
   case "$arg" in
@@ -227,6 +268,7 @@ for arg in "$@"; do
     --skip-android) SKIP_ANDROID=true ;;
     --skip-ios) SKIP_IOS=true ;;
     --skip-mobile) SKIP_ANDROID=true; SKIP_IOS=true ;;
+    --skip-desktop) SKIP_DESKTOP=true ;;
     v[0-9]*.[0-9]*.[0-9]*)
       if [[ ! "$arg" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
         echo "Error: tag must be in format vX.Y.Z (got: $arg)"
@@ -560,6 +602,11 @@ PUBLISH_NOSTR=true
 PUBLISH_PLAY=false
 PUBLISH_APP_STORE=false
 PUBLISH_FAILED=false   # set to true if any selected publish step fails
+# Desktop watcher installers: asked for below, built in the background after
+# step 4 and attached to the GitHub release only.
+BUILD_WATCHER=false
+WATCHER_PID=""
+WATCHER_ARTIFACTS=()
 # Soft state: the binary was uploaded to App Store Connect successfully
 # but the review-submission step could not run because the build is
 # still processing (5-15 min after upload, opaque from our side). The
@@ -603,6 +650,22 @@ if ! $CHECK_VERSIONS_ONLY; then
       *) echo "    Please enter y or n." ;;
     esac
   done
+
+  # Desktop watcher installers ship on the GitHub release only.
+  if $PUBLISH_GITHUB; then
+    if $SKIP_DESKTOP; then
+      echo "    - Desktop watcher (skipped via --skip-desktop, previous installers carried forward)"
+    else
+      while true; do
+        read -rp "    Build the desktop watcher (Linux, Windows, macOS)? [Y/n] " _r
+        case "${_r:-y}" in
+          [Yy]) BUILD_WATCHER=true;  echo "    ✓ Desktop watcher"; break ;;
+          [Nn]) BUILD_WATCHER=false; echo "    ✗ Desktop watcher (previous installers carried forward)"; break ;;
+          *) echo "    Please enter y or n." ;;
+        esac
+      done
+    fi
+  fi
 
   # Zapstore (skipped automatically when Android build is skipped — Zapstore
   # is an Android-only store)
@@ -848,6 +911,41 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+# 4d. Start the desktop watcher installers in the background
+#
+# They start only now because the Windows build fetches a runtime into
+# node_modules, which Gradle reads during step 3, and they reuse the UI
+# bundle step 1 built. They run one after another (each script stages into
+# watch-desktop/dist), alongside the release-notes review, and step 5d
+# collects them. A failed platform is logged and skipped, never blocking the
+# mobile release. macOS signs and notarizes on the Mac mini.
+# ---------------------------------------------------------------------------
+WATCHER_LOG=/tmp/pearcircle-build-watcher.log
+_watcher_builds() {
+  local _v="${RELEASE_TAG#v}" _t
+  export WATCH_SKIP_UI_BUILD=1
+  for _t in linux-x86_64 linux-arm64 windows macos; do
+    echo "=== $_t"
+    if case "$_t" in
+         linux-x86_64) LINUX_ARCH=x86_64 bash watch-desktop/scripts/build-linux.sh "$_v" ;;
+         linux-arm64)  LINUX_ARCH=arm64 bash watch-desktop/scripts/build-linux.sh "$_v" ;;
+         windows)      bash watch-desktop/scripts/build-windows.sh "$_v" ;;
+         macos)        bash watch-desktop/scripts/build-macos.sh "$_v" ;;
+       esac; then
+      echo "$_t ok" >> "$_BG_DIR/watcher.status"
+    else
+      echo "$_t FAILED" >> "$_BG_DIR/watcher.status"
+    fi
+  done
+}
+if $BUILD_WATCHER; then
+  echo "==> Starting the desktop watcher builds in the background (log: $WATCHER_LOG)..."
+  ( cd "$REPO_ROOT" && _watcher_builds ) > "$WATCHER_LOG" 2>&1 < /dev/null &
+  WATCHER_PID=$!
+  _BG_PIDS+=("$WATCHER_PID")
+fi
+
+# ---------------------------------------------------------------------------
 # 4e. Generate .sha256 sidecars for the mobile artifacts
 # ---------------------------------------------------------------------------
 for _artifact in "$APK_NAME" "$AAB_NAME"; do
@@ -1010,6 +1108,32 @@ fi
 # Seeder (peerloomllc/peerloom-seeder) is now the one seeder for every app.
 
 # ---------------------------------------------------------------------------
+# 5d. Collect the desktop watcher installers started in step 4d
+# ---------------------------------------------------------------------------
+if [ -n "$WATCHER_PID" ]; then
+  echo ""
+  echo "==> Waiting for the desktop watcher builds..."
+  wait "$WATCHER_PID" || true
+  sed 's/^/    /' "$_BG_DIR/watcher.status" 2>/dev/null || true
+  grep -q FAILED "$_BG_DIR/watcher.status" 2>/dev/null \
+    && echo "    WARNING: some watcher builds failed and are left out. Log: $WATCHER_LOG"
+  _WV="${RELEASE_TAG#v}"
+  _WD="$REPO_ROOT/watch-desktop/dist"
+  for _f in "$_WD/PearCircleWatcher-${_WV}-x86_64.AppImage" \
+            "$_WD/pearcircle-watch_${_WV}_amd64.deb" \
+            "$_WD/PearCircleWatcher-${_WV}-aarch64.AppImage" \
+            "$_WD/pearcircle-watch_${_WV}_arm64.deb" \
+            "$_WD/PearCircleWatcher-Setup-${_WV}.exe" \
+            "$_WD/PearCircleWatcher-${_WV}-arm64.dmg"; do
+    [ -f "$_f" ] || continue
+    ( cd "$_WD" && sha256sum "$(basename "$_f")" > "$(basename "$_f").sha256" )
+    WATCHER_ARTIFACTS+=("$_f")
+    echo "    - $(basename "$_f")  ($(du -sh "$_f" | cut -f1))"
+  done
+  [ ${#WATCHER_ARTIFACTS[@]} -gt 0 ] || echo "    No watcher installers built; the previous ones will be carried forward."
+fi
+
+# ---------------------------------------------------------------------------
 # 5e. Final gate before publishing
 #
 # The last look at the full asset list. This is the last confirm before
@@ -1021,6 +1145,9 @@ _RELEASE_SUMMARY=""
 [ -n "${APK_NAME:-}" ] && _RELEASE_SUMMARY="APK (${APK_SIZE:-?})"
 if $PUBLISH_PLAY && [ -n "${AAB_NAME:-}" ]; then
   _RELEASE_SUMMARY="${_RELEASE_SUMMARY:+$_RELEASE_SUMMARY, }AAB (${AAB_SIZE:-?})"
+fi
+if [ ${#WATCHER_ARTIFACTS[@]} -gt 0 ]; then
+  _RELEASE_SUMMARY="${_RELEASE_SUMMARY:+$_RELEASE_SUMMARY, }${#WATCHER_ARTIFACTS[@]} desktop watcher installer(s)"
 fi
 [ -z "$_RELEASE_SUMMARY" ] && _RELEASE_SUMMARY="no artifacts"
 _confirm "$_RELEASE_SUMMARY ready to publish?"
@@ -1034,6 +1161,7 @@ _confirm "$_RELEASE_SUMMARY ready to publish?"
 if $PUBLISH_GITHUB; then
   _have_upload=false
   [ -n "${APK_NAME:-}" ] && [ -f "$APK_NAME" ] && _have_upload=true
+  [ ${#WATCHER_ARTIFACTS[@]} -gt 0 ] && _have_upload=true
   if ! $_have_upload; then
     echo ""
     echo "==> No artifacts to upload — skipping GitHub release step."
@@ -1140,6 +1268,21 @@ if $SKIP_ANDROID; then
     echo "==> Carrying forward $(basename "$(printf '%s\n' "$_CARRIED" | head -1)") from the previous release."
   else
     echo "==> WARNING: no APK carried forward - this release will have no Android download."
+  fi
+fi
+for _w in "${WATCHER_ARTIFACTS[@]}"; do
+  RELEASE_ASSETS+=("$_w")
+  [ -f "${_w}.sha256" ] && RELEASE_ASSETS+=("${_w}.sha256")
+done
+# Without watcher installers of its own, the release carries the previous ones
+# forward, so the website's releases/latest link keeps a desktop download.
+if [ ${#WATCHER_ARTIFACTS[@]} -eq 0 ]; then
+  _CARRIED=$(_carry_forward_watcher "$GH_TOKEN" "$REPO_SLUG" "$(mktemp -d)")
+  if [ -n "$_CARRIED" ]; then
+    while IFS= read -r _c; do RELEASE_ASSETS+=("$_c"); done <<< "$_CARRIED"
+    echo "==> Carrying forward $(( $(printf '%s\n' "$_CARRIED" | wc -l) / 2 )) desktop watcher installer(s) from the previous release."
+  else
+    echo "==> No desktop watcher installers to carry forward."
   fi
 fi
 echo ""
@@ -1766,6 +1909,7 @@ else
   echo "    Syncing repo to $MAC_MINI (including freshly built bundles)..."
   rsync -az --rsync-path=/opt/homebrew/bin/rsync \
     --exclude='.git' --exclude='node_modules' --exclude='android' \
+    --exclude='/watch-desktop/dist' --exclude='/seeder-launcher/dist' \
     --exclude='/*.apk' --exclude='/*.aab' --exclude='/*.AppImage' --exclude='/*.deb' --exclude='/*.exe' \
     --exclude='/*.dmg' --exclude='/*.ipa' --exclude='/*.sha256' --exclude='/*.blockmap' --exclude='/latest*.yml' \
     "$REPO_ROOT/" "${MAC_MINI}:${MAC_MINI_REPO_PATH}/"
