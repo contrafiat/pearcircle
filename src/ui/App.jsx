@@ -5300,7 +5300,7 @@ function CirclesSection ({ active = true, onChanged }) {
           }
           return (
             <li key={c.circleId} style={{
-              display: 'flex', alignItems: 'center', gap: spacing.sm,
+              display: 'flex', alignItems: 'center', gap: spacing.sm, flexWrap: 'wrap',
               padding: `${spacing.sm}px 0`,
               borderBottom: `1px solid ${colors.divider}`,
             }}>
@@ -5316,29 +5316,6 @@ function CirclesSection ({ active = true, onChanged }) {
                 {c.waitingOn.length > 0 && (
                   <div style={{ ...typography.caption, color: colors.text.secondary }}>
                     Owner tools unlock once everyone has the latest PearCircle. Waiting on {c.waitingOn.join(', ')}.
-                  </div>
-                )}
-                {c.watchers.length > 0 && (
-                  <div style={{ marginTop: spacing.xs }}>
-                    <div style={{ ...typography.caption, color: colors.text.secondary }}>Watching</div>
-                    {c.watchers.map((w) => (
-                      <div key={w.pubkey} style={{ display: 'flex', alignItems: 'center', gap: spacing.sm, marginTop: 2 }}>
-                        <Desktop size={14} weight="regular" color={colors.text.secondary} />
-                        <span style={{ ...typography.caption, color: colors.text.primary, flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{w.label}</span>
-                        {c.writable && (
-                          <button
-                            onClick={() => { setError(null); setRemovingWatcher({ circleId: c.circleId, circleName: c.name, pubkey: w.pubkey, label: w.label }) }}
-                            style={{
-                              padding: '2px 10px', borderRadius: radius.sm,
-                              background: 'transparent', color: colors.error,
-                              border: `1px solid ${colors.border}`, cursor: 'pointer',
-                              fontFamily: typography.fontFamily, fontSize: 12, fontWeight: 400,
-                            }}>
-                            Remove
-                          </button>
-                        )}
-                      </div>
-                    ))}
                   </div>
                 )}
                 {/* The move notice never landed in this circle, so its members
@@ -5407,6 +5384,29 @@ function CirclesSection ({ active = true, onChanged }) {
                   style={iconBtnStyle({ disabled: isPending, destructive: true })}>
                   <SignOut size={18} weight="regular" />
                 </button>
+              )}
+              {/* Watch-only desktops (proposal 2026-10-18-watch-only-client),
+                  full width under the row so the remove icons line up with
+                  the circle's own icons on the right. */}
+              {c.watchers.length > 0 && (
+                <div style={{ flexBasis: '100%' }}>
+                  <div style={{ ...typography.caption, color: colors.text.secondary }}>Watching</div>
+                  {c.watchers.map((w) => (
+                    <div key={w.pubkey} style={{ display: 'flex', alignItems: 'center', gap: spacing.sm, marginTop: 2 }}>
+                      <Desktop size={14} weight="regular" color={colors.text.secondary} />
+                      <span style={{ ...typography.caption, color: colors.text.primary, flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{w.label}</span>
+                      {c.writable && (
+                        <button
+                          onClick={() => { setError(null); setRemovingWatcher({ circleId: c.circleId, circleName: c.name, pubkey: w.pubkey, label: w.label }) }}
+                          title='Remove watcher'
+                          aria-label={'Remove watcher ' + w.label}
+                          style={iconBtnStyle({ destructive: true })}>
+                          <Trash size={18} weight="regular" />
+                        </button>
+                      )}
+                    </div>
+                  ))}
+                </div>
               )}
             </li>
           )
