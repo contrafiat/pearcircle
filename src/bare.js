@@ -59,6 +59,7 @@ const { revocationNoticeFor, recordRevocationNotice, clearRevocationNotice, load
 const { circleIsDeleted, memberHiddenByLeft, memberHiddenByRemoved, shouldAcceptRemovedRow, shouldRecoverFromTombstone } = require('./lib/circleFilter')
 const { memberHiddenByHide, memberLastActiveAt, canHideMember, shouldAcceptHiddenRow } = require('./lib/memberHide')
 const { shouldAcceptWatcherRow, shouldAcceptWatcherRemovedRow, watcherActive, checkWatcherHello } = require('./lib/watcher')
+const { liveRecipientSet } = require('./lib/liveRecipients')
 const accountBackup = require('./lib/accountBackup')
 const { OWNER_V2_CAP, activeCoowners, isAuthorized, hasOwnerV2Cap, circleOwnerV2Ready, shouldAcceptCircleRow, shouldAcceptSignedRemovedRow, shouldAcceptCoownerRow } = require('./lib/ownerAuth')
 const { haversineMeters, classify, isFixUsable, applyRegionEvent, selectNearestRegions, regionAppendDecision, MIN_PLACE_RADIUS_M, OS_REGION_MIN_RADIUS_M } = require('./lib/geofence')
@@ -303,6 +304,92 @@ function liveChannelDropConn (conn) {
 }
 function liveChannelDropCircle (circleId) {
   _liveByCircle.delete(circleId)
+  _liveRecipients.delete(circleId)
+}
+
+// Who may receive our live position, per circle (proposal
+// 2026-10-18-watch-only-client slice 2): current members plus active
+// watchers. circleId → { base, gen, set }. Rebuilt off the view whenever
+// invalidateCircleView bumps the gen. Until the first build lands we send to
+// nobody, and the build then sends our current fix to everyone it allows.
+// While a rebuild is pending we keep using the previous set: every applied
+// write bumps the gen, including our own lastSeen dual-write just before a
+// broadcast, so treating a stale set as empty would drop most broadcasts.
+const _liveRecipients = new Map()
+const _liveRecipientsPending = new Map() // circleId → timer
+const LIVE_RECIPIENTS_DEBOUNCE_MS = 250
+
+function connPubkeyHex (conn) {
+  return conn?.remotePublicKey ? b4a.toString(conn.remotePublicKey, 'hex').toLowerCase() : null
+}
+
+// The latest built set (scheduling a rebuild if it is out of date), or null
+// if none has been built for the current base yet.
+function liveRecipientsFor (circleId) {
+  const entry = _liveRecipients.get(circleId)
+  const base = _circleBases.get(circleId)
+  if (!entry || entry.base !== base) { scheduleLiveRecipientsRefresh(circleId); return null }
+  if (entry.gen !== (_viewGen.get(circleId) || 0)) scheduleLiveRecipientsRefresh(circleId)
+  return entry.set
+}
+
+function liveRecipientAllowed (circleId, conn) {
+  const set = liveRecipientsFor(circleId)
+  if (!set) return false
+  const pk = connPubkeyHex(conn)
+  return !!pk && set.has(pk)
+}
+
+function scheduleLiveRecipientsRefresh (circleId) {
+  if (_liveRecipientsPending.has(circleId)) return
+  const t = setTimeout(() => {
+    _liveRecipientsPending.delete(circleId)
+    refreshLiveRecipients(circleId).catch((e) => {
+      console.warn('[bare] refreshLiveRecipients failed', circleId, e?.message)
+    })
+  }, LIVE_RECIPIENTS_DEBOUNCE_MS)
+  if (typeof t.unref === 'function') t.unref()
+  _liveRecipientsPending.set(circleId, t)
+}
+
+async function readLiveRecipientRows (view) {
+  const rows = { members: new Map(), leftAt: new Map(), removedAt: new Map(), watchers: new Map(), watcherRemovedAt: new Map() }
+  const scan = async (prefix, into, field) => {
+    for await (const { key, value } of view.createReadStream({ gt: prefix, lt: prefix + '~' })) {
+      if (typeof value?.[field] === 'number') into.set(key.slice(prefix.length), value[field])
+    }
+  }
+  await scan('member:', rows.members, 'joinedAt')
+  await scan('left:', rows.leftAt, 'leftAt')
+  await scan('removed:', rows.removedAt, 'ts')
+  await scan('watcher:', rows.watchers, 'ts')
+  await scan('watcherRemoved:', rows.watcherRemovedAt, 'ts')
+  return rows
+}
+
+async function refreshLiveRecipients (circleId) {
+  const base = _circleBases.get(circleId)
+  if (!base) return
+  const gen = _viewGen.get(circleId) || 0
+  const set = liveRecipientSet(await readLiveRecipientRows(base.view))
+  if (_circleBases.get(circleId) !== base) return
+  // Store it under the gen we started from even if a write landed mid-scan,
+  // so busy circles still get a set. liveRecipientsFor sees the older gen and
+  // builds again.
+  if ((_viewGen.get(circleId) || 0) !== gen) scheduleLiveRecipientsRefresh(circleId)
+  const prev = _liveRecipients.get(circleId)
+  const prevSet = prev && prev.base === base ? prev.set : new Set()
+  _liveRecipients.set(circleId, { base, gen, set })
+  // Peers we couldn't send to before (a new member, a new watcher, or
+  // everyone on the first build) get our current fix now instead of waiting
+  // for our next location update.
+  if (!getCircleSharing(circleId).enabled || !_selfLastSeen) return
+  const byConn = _liveByCircle.get(circleId)
+  if (!byConn) return
+  for (const [conn, sendFn] of byConn) {
+    const pk = connPubkeyHex(conn)
+    if (pk && set.has(pk) && !prevSet.has(pk)) sendFn(_selfLastSeen)
+  }
 }
 // Per-member last-known cores (proposal 2026-06-04-lastseen-ephemeral, slice 2a).
 // The bounded, persisted offline fallback that will replace the Autobase
@@ -4204,6 +4291,7 @@ const _viewGen = new Map() // circleId → number
 function invalidateCircleView (circleId) {
   _viewGen.set(circleId, (_viewGen.get(circleId) || 0) + 1)
   _viewSnapshotCache.delete(circleId)
+  if (_liveRecipients.has(circleId)) scheduleLiveRecipientsRefresh(circleId)
 }
 
 // Read (and cache) the view-derived part of a circle snapshot. Pure reads off
@@ -6031,7 +6119,7 @@ function setupLiveChannelFor (conn, circleId) {
     conn,
     circleId,
     mark,
-    getOutgoing: () => (getCircleSharing(circleId).enabled ? _selfLastSeen : null),
+    getOutgoing: () => (getCircleSharing(circleId).enabled && liveRecipientAllowed(circleId, conn) ? _selfLastSeen : null),
     onPosition: (value) => { handleLivePosition(circleId, value).catch(() => {}) },
   })
   if (!handle) return
@@ -6128,12 +6216,15 @@ async function handleLivePosition (circleId, value) {
   send({ event: 'circle:liveLocation', data: { circleId } })
 }
 
-// Broadcast a signed fix to every connected peer's live channel for a circle.
+// Broadcast a signed fix to every connected member and watcher on a circle's
+// live channel. Other peers on the topic get nothing (slice 2 of proposal
+// 2026-10-18-watch-only-client).
 function broadcastLive (circleId, value) {
   let sent = 0
   const byConn = _liveByCircle.get(circleId)
   if (byConn) {
-    for (const sendFn of byConn.values()) {
+    for (const [conn, sendFn] of byConn) {
+      if (!liveRecipientAllowed(circleId, conn)) continue
       if (sendFn(value)) sent++
     }
   }
