@@ -20,14 +20,31 @@ const { spawn } = require('node:child_process')
 const { WebSocketServer } = require('ws')
 const { Worklet } = require('../seeder-launcher/host/worklet.js')
 
-const ROOT = path.resolve(__dirname, '..')
+// Two layouts. Packaged (AppImage / .deb, built by scripts/build-linux.sh):
+// host-bundled.js sits next to bare, worklet/worklet.bundle and ui/. From a
+// checkout: this file is in watch-desktop/ and everything comes from the repo.
+const PACKAGED = fs.existsSync(path.join(__dirname, 'worklet', 'worklet.bundle'))
+const ROOT = PACKAGED ? __dirname : path.resolve(__dirname, '..')
+const PATHS = PACKAGED
+  ? {
+      bare: path.join(ROOT, 'bare'),
+      bundle: path.join(ROOT, 'worklet', 'worklet.bundle'),
+      indexHtml: path.join(ROOT, 'ui', 'index.html'),
+      uiBundle: path.join(ROOT, 'ui', 'app-ui.bundle'),
+    }
+  : {
+      bare: path.join(ROOT, 'node_modules', 'bare-runtime-linux-x64', 'bin', 'bare'),
+      bundle: path.join(ROOT, 'src', 'bare.js'),
+      indexHtml: path.join(ROOT, 'src', 'ui', 'index.html'),
+      uiBundle: path.join(ROOT, 'assets', 'app-ui.bundle'),
+    }
 
 function parseArgs (argv) {
   const out = {
     dataDir: path.join(os.homedir(), '.local', 'share', 'pearcircle-watch'),
     port: 8743,
     label: os.hostname().slice(0, 40),
-    bare: path.join(ROOT, 'node_modules', 'bare-runtime-linux-x64', 'bin', 'bare'),
+    bare: PATHS.bare,
     open: true,
   }
   for (let i = 0; i < argv.length; i++) {
@@ -68,7 +85,7 @@ function makeShell (settingsPath) {
 
 // The UI's index.html with the bridge loaded ahead of the bundle.
 function pageHtml () {
-  const html = fs.readFileSync(path.join(ROOT, 'src', 'ui', 'index.html'), 'utf8')
+  const html = fs.readFileSync(PATHS.indexHtml, 'utf8')
   return html.replace('<script src="app-ui.bundle"></script>', '<script src="bridge.js"></script>\n    <script src="app-ui.bundle"></script>')
 }
 
@@ -101,6 +118,10 @@ const BRIDGE_JS = `(() => {
 async function main () {
   const opts = parseArgs(process.argv.slice(2))
   fs.mkdirSync(opts.dataDir, { recursive: true })
+  const openLink = (link) => {
+    if (!opts.open) return
+    try { spawn('xdg-open', [link], { stdio: 'ignore', detached: true }).unref() } catch {}
+  }
   const tokenPath = path.join(opts.dataDir, 'auth.token')
   let token
   try { token = fs.readFileSync(tokenPath, 'utf8').trim() } catch {}
@@ -114,7 +135,7 @@ async function main () {
 
   const worklet = new Worklet({
     barePath: opts.bare,
-    bundleEntry: path.join(ROOT, 'src', 'bare.js'),
+    bundleEntry: PATHS.bundle,
     dataDir: opts.dataDir,
     args: [],
     initArgs: { mode: 'watch', label: opts.label },
@@ -122,6 +143,21 @@ async function main () {
   })
 
   const clients = new Set()
+  // The app has no window of its own, so when it opened the browser itself
+  // it quits a while after the last tab closes. A reload reconnects within a
+  // second. With --no-open (run as a service or from a script) it stays up.
+  let idleTimer = null
+  const IDLE_EXIT_MS = 60 * 1000
+  const FIRST_TAB_GRACE_MS = 3 * 60 * 1000
+  const armIdleExit = (ms) => {
+    if (!opts.open || idleTimer) return
+    idleTimer = setTimeout(async () => {
+      log('host', 'no open tabs, quitting')
+      await worklet.stop()
+      process.exit(0)
+    }, ms)
+  }
+  const cancelIdleExit = () => { if (idleTimer) { clearTimeout(idleTimer); idleTimer = null } }
   worklet.on('event', ({ name, data }) => {
     const line = JSON.stringify({ type: 'event', name, data })
     for (const ws of clients) { try { ws.send(line) } catch {} }
@@ -131,9 +167,24 @@ async function main () {
     console.error('PearCircle watcher stopped unexpectedly. See ' + logPath)
     process.exit(1)
   })
+  // Already running (the app launched twice from the menu): open the
+  // running one's page and leave. Checked before starting a second worklet,
+  // which would fail on the store lock anyway.
+  const busy = await new Promise((resolve) => {
+    const probe = http.get({ host: '127.0.0.1', port: opts.port, path: '/bridge.js', timeout: 1500 }, (res) => { res.resume(); resolve(res.statusCode === 200) })
+    probe.on('error', () => resolve(false))
+    probe.on('timeout', () => { probe.destroy(); resolve(false) })
+  })
+  if (busy) {
+    const link = 'http://127.0.0.1:' + opts.port + '/?t=' + token
+    console.log('PearCircle watcher is already running. Open: ' + link)
+    openLink(link)
+    process.exit(0)
+  }
+
   await worklet.start()
 
-  const uiBundle = path.join(ROOT, 'assets', 'app-ui.bundle')
+  const uiBundle = PATHS.uiBundle
   const server = http.createServer((req, res) => {
     const url = new URL(req.url, 'http://127.0.0.1')
     if (url.pathname === '/' || url.pathname === '/index.html') {
@@ -157,7 +208,8 @@ async function main () {
     if (url.pathname !== '/ws' || url.searchParams.get('t') !== token) { socket.destroy(); return }
     wss.handleUpgrade(req, socket, head, (ws) => {
       clients.add(ws)
-      ws.on('close', () => clients.delete(ws))
+      cancelIdleExit()
+      ws.on('close', () => { clients.delete(ws); if (clients.size === 0) armIdleExit(IDLE_EXIT_MS) })
       ws.on('message', async (raw) => {
         let msg
         try { msg = JSON.parse(raw.toString()) } catch { return }
@@ -180,9 +232,8 @@ async function main () {
     const link = 'http://127.0.0.1:' + opts.port + '/?t=' + token
     console.log('PearCircle watcher is running as "' + opts.label + '".')
     console.log('Open: ' + link)
-    if (opts.open) {
-      try { spawn('xdg-open', [link], { stdio: 'ignore', detached: true }).unref() } catch {}
-    }
+    openLink(link)
+    armIdleExit(FIRST_TAB_GRACE_MS)
   })
 
   const stop = async () => { await worklet.stop(); process.exit(0) }
