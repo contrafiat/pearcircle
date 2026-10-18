@@ -58,6 +58,7 @@ const { summarizeSeederCoverage } = require('./lib/seederCoverage')
 const { revocationNoticeFor, recordRevocationNotice, clearRevocationNotice, loadRevokedCircles } = require('./lib/seederRevocation')
 const { circleIsDeleted, memberHiddenByLeft, memberHiddenByRemoved, shouldAcceptRemovedRow, shouldRecoverFromTombstone } = require('./lib/circleFilter')
 const { memberHiddenByHide, memberLastActiveAt, canHideMember, shouldAcceptHiddenRow } = require('./lib/memberHide')
+const { shouldAcceptWatcherRow, shouldAcceptWatcherRemovedRow, watcherActive, checkWatcherHello } = require('./lib/watcher')
 const accountBackup = require('./lib/accountBackup')
 const { OWNER_V2_CAP, activeCoowners, isAuthorized, hasOwnerV2Cap, circleOwnerV2Ready, shouldAcceptCircleRow, shouldAcceptSignedRemovedRow, shouldAcceptCoownerRow } = require('./lib/ownerAuth')
 const { haversineMeters, classify, isFixUsable, applyRegionEvent, selectNearestRegions, regionAppendDecision, MIN_PLACE_RADIUS_M, OS_REGION_MIN_RADIUS_M } = require('./lib/geofence')
@@ -2089,6 +2090,28 @@ const handlers = {
     }
     mark('coowner:set', { cid: circleId.slice(0, 8), pk: pubkey.slice(0, 8), coowner })
     return { ok: true, pubkey, coowner }
+  },
+
+  // Remove a watch-only desktop from the circle (proposal
+  // 2026-10-18-watch-only-client). Any member can do it. Phones stop sending
+  // it live positions, but it can still read the circle until the circle moves
+  // to a new invite.
+  'watcher:remove': async ({ circleId, pubkey } = {}) => {
+    if (!_initialized) throw new Error('worklet not initialized')
+    if (typeof circleId !== 'string') throw new Error('circleId must be a string')
+    if (typeof pubkey !== 'string' || !/^[0-9a-f]{64}$/i.test(pubkey)) throw new Error('pubkey must be a 64-char hex string')
+    const base = _circleBases.get(circleId)
+    if (!base) throw new Error('unknown circle: ' + circleId)
+    if (!base.writable) throw new Error('not yet a writer for this circle')
+    const row = (await base.view.get('watcher:' + pubkey))?.value
+    if (!row) throw new Error('not a watcher of this circle')
+    const ourKeyHex = b4a.toString(_identity.publicKey, 'hex')
+    const value = signValue({ pubkey, removedBy: ourKeyHex, ts: Date.now(), v: 1 }, _identity.secretKey)
+    if (!(await safeAppend(base, { type: 'put', key: 'watcherRemoved:' + pubkey, value }, 'watcherRemoved'))) {
+      throw new Error('could not save the change, try again')
+    }
+    mark('watcher:remove', { cid: circleId.slice(0, 8), pk: pubkey.slice(0, 8) })
+    return { ok: true, pubkey }
   },
 
   // Hide a member who hasn't been seen in 30 days, for the whole circle
@@ -4512,6 +4535,31 @@ async function memberSelfAnchor (view) {
 // self-suppression, the freshness window, the post-dates-our-join anchor,
 // per-(circle,pubkey,joinedAt) in-session dedup, and a circle-deleted
 // check. memberValue is the stored member: row.
+// Tell the UI a watcher was added, so it can notify every member (proposal
+// 2026-10-18-watch-only-client). Same freshness and dedup gates as
+// emitMemberJoined. The apply rule only gets here for a row newer than the
+// one we held, so a re-apply of the same row doesn't reach it.
+async function emitWatcherAdded (view, circleId, row) {
+  try {
+    if (!circleId || typeof row?.ts !== 'number' || typeof row.pubkey !== 'string') return
+    if (Date.now() - row.ts > MEMBER_NOTIF_FRESHNESS_MS) return
+    const removedTs = (await view.get('watcherRemoved:' + row.pubkey))?.value?.ts
+    if (!watcherActive(row.ts, removedTs)) return
+    const dedupKey = 'watcher:' + circleId + ':' + row.pubkey + ':' + row.ts
+    if (_emittedMemberJoinKeys.has(dedupKey)) return
+    rememberEmitted(_emittedMemberJoinKeys, dedupKey, _EMITTED_MEMBER_MAX)
+    const circleRow = await view.get('circle')
+    if (circleRow?.value?.deleted) return
+    send({ event: 'watcher:added', data: {
+      circleId,
+      pubkey: row.pubkey,
+      label: row.label,
+      addedBy: row.addedBy,
+      circleName: circleRow?.value?.name || 'Circle',
+    }})
+  } catch {}
+}
+
 async function emitMemberJoined (view, circleId, memberValue, priorValue) {
   try {
     const joinedAt = memberValue && memberValue.joinedAt
@@ -4796,6 +4844,31 @@ async function applyCircleNodes (nodes, view, base, circleId) {
         if (!shouldAcceptHiddenRow({ keyPubkey, value: incoming, futureToleranceMs: FUTURE_TS_TOLERANCE_MS, verifySig: (v) => verifyValueWithSigner(v, 'hiddenBy') })) continue
         const existingHidden = (await view.get(op.key))?.value
         if (existingHidden && typeof existingHidden.ts === 'number' && incoming.ts <= existingHidden.ts) continue
+        await view.put(op.key, incoming)
+        continue
+      }
+      // `watcher:{pubkey}` / `watcherRemoved:{pubkey}` (proposal
+      // 2026-10-18-watch-only-client): a member writes these for a watch-only
+      // desktop, which is never a writer itself. Signed by `addedBy` /
+      // `removedBy`, who must be a member. LWW on `ts` within each key.
+      if (op.key.startsWith('watcher:')) {
+        const incoming = op.value
+        const keyPubkey = op.key.slice('watcher:'.length)
+        const addedByIsMember = typeof incoming?.addedBy === 'string' && !!(await view.get('member:' + incoming.addedBy))?.value
+        if (!shouldAcceptWatcherRow({ keyPubkey, value: incoming, addedByIsMember, futureToleranceMs: FUTURE_TS_TOLERANCE_MS, verifySig: (v) => verifyValueWithSigner(v, 'addedBy') })) continue
+        const existing = (await view.get(op.key))?.value
+        if (existing && typeof existing.ts === 'number' && incoming.ts <= existing.ts) continue
+        await view.put(op.key, incoming)
+        await emitWatcherAdded(view, circleId, incoming)
+        continue
+      }
+      if (op.key.startsWith('watcherRemoved:')) {
+        const incoming = op.value
+        const keyPubkey = op.key.slice('watcherRemoved:'.length)
+        const removedByIsMember = typeof incoming?.removedBy === 'string' && !!(await view.get('member:' + incoming.removedBy))?.value
+        if (!shouldAcceptWatcherRemovedRow({ keyPubkey, value: incoming, removedByIsMember, futureToleranceMs: FUTURE_TS_TOLERANCE_MS, verifySig: (v) => verifyValueWithSigner(v, 'removedBy') })) continue
+        const existing = (await view.get(op.key))?.value
+        if (existing && typeof existing.ts === 'number' && incoming.ts <= existing.ts) continue
         await view.put(op.key, incoming)
         continue
       }
@@ -5935,6 +6008,7 @@ function openPairChannelsForCircle (circleId, base) {
       onWriterAdded: (writerKey) => {
         send({ event: 'circle:writer:added', data: { circleId, writerKey } })
       },
+      ...watcherPairOpts(circleId),
       mark,
     })
     if (ch) { opened++; trackCircleChannel(circleId, ch) }
@@ -5977,6 +6051,49 @@ function registerLiveNotify (conn) {
     if (liveChannelHas(circleIdStr, conn)) return // already open
     setupLiveChannelFor(conn, circleIdStr)
   })
+}
+
+// Member side of the watcher pair flow (proposal 2026-10-18-watch-only-client).
+// The desktop re-sends its hello every few seconds until its row lands, so
+// _watcherHelloInFlight stops us appending the same row more than once.
+const _watcherHelloInFlight = new Set()
+async function handleWatcherHello (circleId, msg, remotePublicKey) {
+  const base = _circleBases.get(circleId)
+  if (!base || !base.writable || !_identity) return
+  const pk = typeof msg?.pubkey === 'string' ? msg.pubkey : ''
+  const flightKey = circleId + ':' + pk
+  if (_watcherHelloInFlight.has(flightKey)) return
+  _watcherHelloInFlight.add(flightKey)
+  try {
+    const view = base.view
+    const isMember = !!(await view.get('member:' + pk).catch(() => null))?.value
+    const addedTs = (await view.get('watcher:' + pk).catch(() => null))?.value?.ts
+    const removedTs = (await view.get('watcherRemoved:' + pk).catch(() => null))?.value?.ts
+    const verdict = checkWatcherHello({
+      msg,
+      remotePublicKey,
+      isMember,
+      hasActiveWatcherRow: watcherActive(addedTs, removedTs),
+      wasRemoved: typeof removedTs === 'number',
+    })
+    if (!verdict.ok) {
+      mark('watcher:hello-ignored', { cid: circleId.slice(0, 8), reason: verdict.reason })
+      return
+    }
+    const ourKeyHex = b4a.toString(_identity.publicKey, 'hex')
+    const value = signValue({ pubkey: verdict.pubkey, label: verdict.label, addedBy: ourKeyHex, ts: Date.now(), v: 1 }, _identity.secretKey)
+    if (await safeAppend(base, { type: 'put', key: 'watcher:' + verdict.pubkey, value }, 'watcher')) {
+      mark('watcher:added', { cid: circleId.slice(0, 8), pk: verdict.pubkey.slice(0, 8) })
+    }
+  } finally {
+    _watcherHelloInFlight.delete(flightKey)
+  }
+}
+
+// Pair-channel options for the watcher flow, shared by every setupPairChannel
+// call site.
+function watcherPairOpts (circleId) {
+  return { onWatcherHello: (msg, remote) => handleWatcherHello(circleId, msg, remote) }
 }
 
 // Verify + gate a received live position, then store the freshest per member.
@@ -6544,6 +6661,7 @@ function registerPairNotify (conn) {
       onWriterAdded: (writerKey) => {
         send({ event: 'circle:writer:added', data: { circleId: circleIdStr, writerKey } })
       },
+      ...watcherPairOpts(circleIdStr),
       mark,
     })
     trackCircleChannel(circleIdStr, ch)
@@ -7461,6 +7579,7 @@ async function onSwarmConnection (conn, info) {
       onWriterAdded: (writerKey) => {
         send({ event: 'circle:writer:added', data: { circleId, writerKey } })
       },
+      ...watcherPairOpts(circleId),
       mark,
     })
     trackCircleChannel(circleId, ch)

@@ -1,6 +1,6 @@
 # Watch-only desktop client
 
-**Status**: Approved 2026-10-18 by Tim, with open questions 1-3 resolved as proposed: any member can make a watch invite, every member is notified when a watcher is added and v1 shows positions only (no trips). Question 4 (Linux only for v1) is still open.
+**Status**: Approved 2026-10-18 by Tim, with open questions 1-3 resolved as proposed: any member can make a watch invite, every member is notified when a watcher is added and v1 shows positions only (no trips). Question 4 also resolved as proposed: Linux first. Amended the same day after review of the join flow: watch invites carry no one-time code (see section 2).
 
 **Goal**: A desktop app that joins a circle and shows members on the map, the same as a phone. It never shares a location and does not appear in the member list. Every member can see that a watcher exists in a separate "Watching" list and can remove it.
 
@@ -52,15 +52,17 @@ Apply rule, next to `member:` / `left:` / `removed:` in `applyCircleNodes`:
 - Reject a `ts` more than 5 min in the future.
 - Last write wins on `ts`.
 
-Removal is `watcherRemoved:{pubkey}` with the same shape (`removedBy` in place of `addedBy`). Any member can write it. A remove newer than the watcher row wins, the same LWW comparison as `memberHiddenByHide`. Re-adding a removed watcher needs a fresh watcher row from a member, which needs a fresh watch invite (below).
+Removal is `watcherRemoved:{pubkey}` with the same shape (`removedBy` in place of `addedBy`). Any member can write it. A remove newer than the watcher row wins, the same LWW comparison as `memberHiddenByHide`. Phones never re-add a removed watcher from its hello, so a removed desktop stays removed. A desktop that resets and comes back with a new identity is a new watcher, and every member gets the added notice again.
 
 Any member can remove a watcher. Watchers can see where everyone is, so each member should be able to cut one off without asking the owner.
 
 ### 2. Joining as a watcher
 
-New pair-channel message `watcherHello { pubkey, label, sig }`, sent by the watcher in place of `writerHello`. A member that receives it appends the `watcher:` row, but only if the invite it came through was a **watch invite**.
+New pair-channel message `watcherHello { pubkey, label }`, sent by the watcher in place of `writerHello`. Any online member that receives it appends the `watcher:` row. The hello needs no signature: the member checks that `pubkey` is the connection's remote key, which the Noise handshake already proves. Older phones ignore the message, since protomux drops message types it doesn't know.
 
-Watch invites are a new invite flavour: the normal invite plus `role=watch` and a one-time `watchToken`. The inviting phone stores the token locally and only accepts a `watcherHello` that presents it. This stops a normal member invite from being turned into a watcher by anyone who sees the link, and it means a watcher only appears after a member deliberately made a watch invite.
+A watch invite is the normal invite plus `role=watch`. The flag only tells the joining app to join as a watcher. Older apps ignore it and join as a member.
+
+An earlier draft added a one-time code that only the inviting phone could check. Dropped on 2026-10-18: if that phone was offline the desktop could not join, and the code protected nothing, since anyone holding any invite can already join as a full member.
 
 Any member can make a watch invite, matching how any member can invite today (decided 2026-10-18).
 
