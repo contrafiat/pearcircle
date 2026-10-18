@@ -313,6 +313,11 @@ function toSharingState (resp) {
     anyPaused: anyPausedFrom(map),
   }
 }
+// Watch-only desktop (proposal 2026-10-18-watch-only-client): set by the
+// desktop host before the bundle loads. Hides everything that needs a phone
+// or writes to a circle: sharing, profile, places editing, trips, invites.
+const WATCH_ONLY = typeof window !== 'undefined' && window.__pearWatchOnly === true
+
 function anyPausedFrom (map) {
   for (const v of Object.values(map)) if (v && v.enabled === false) return true
   return false
@@ -2539,7 +2544,8 @@ function HomeMapView ({ identity, profile, sharing, tileStyleUrl, setView, setSh
       const cur = out.lastSeen[myPubkey]
       if (!cur || (selfSeen.ts ?? 0) > (cur.ts ?? 0)) out.lastSeen[myPubkey] = selfSeen
     }
-    if (myPubkey && !out.members.some(m => m.value?.pubkey === myPubkey)) {
+    // The watch-only desktop is not a member and has no location of its own.
+    if (!WATCH_ONLY && myPubkey && !out.members.some(m => m.value?.pubkey === myPubkey)) {
       out.members.push({
         key: 'member:' + myPubkey,
         value: {
@@ -2633,7 +2639,7 @@ function HomeMapView ({ identity, profile, sharing, tileStyleUrl, setView, setSh
   const syncBannerEligible = syncFailCount >= SYNC_FAIL_BANNER_THRESHOLD && !syncBannerDismissed
   const backupBannerEligible = backupStatus != null && circles.length > 0 && !backupBannerSnoozed &&
     (!lastBackupAt(backupStatus) || Date.now() - lastBackupAt(backupStatus) > BACKUP_REMINDER_MS)
-  const topBanner = tourActive ? null
+  const topBanner = tourActive || WATCH_ONLY ? null
     : permissionBannerEligible ? 'permission'
     : batteryBannerEligible ? 'battery'
     : networkBannerEligible ? 'network'
@@ -3213,7 +3219,7 @@ function HomeMapView ({ identity, profile, sharing, tileStyleUrl, setView, setSh
               >
                 {c.circle?.name || CIRCLE_NAME_PENDING}
               </button>
-              <button
+              {!WATCH_ONLY && <button
                 onClick={() => {
                   setMenuOpen(false)
                   setSheet({ name: 'invite', circleId: c.circleId, circleName: c.circle?.name || 'Circle' })
@@ -3226,16 +3232,18 @@ function HomeMapView ({ identity, profile, sharing, tileStyleUrl, setView, setSh
                   border: 'none', borderRadius: 6, cursor: 'pointer',
                 }}>
                 <ShareNetwork size={16} weight='thin' />
-              </button>
+              </button>}
             </div>
           ))}
           {circles.length > 0 && <div style={s.menuDivider} />}
-          <button
-            style={s.menuItem}
-            onClick={() => { setMenuOpen(false); setSheet({ name: 'create' }) }}
-          >
-            + Create Circle
-          </button>
+          {!WATCH_ONLY && (
+            <button
+              style={s.menuItem}
+              onClick={() => { setMenuOpen(false); setSheet({ name: 'create' }) }}
+            >
+              + Create Circle
+            </button>
+          )}
           <button
             style={s.menuItem}
             onClick={() => { setMenuOpen(false); setSheet({ name: 'join' }) }}
@@ -3303,10 +3311,11 @@ function HomeMapView ({ identity, profile, sharing, tileStyleUrl, setView, setSh
       </div>
 
       {/* Find-me FAB stacked above the About FAB. Plain camera helper:
+          hidden on the watch-only desktop, which has no location.
           tap = flyTo self's last-known coords, no focus-mode change, no
           sheet. Dimmed/no-op when we don't have a fix yet (selfSeen is
           null on cold-start before the first location:update). */}
-      <button
+      {!WATCH_ONLY && <button
         type='button'
         onClick={() => {
           if (!selfSeen) return
@@ -3334,13 +3343,28 @@ function HomeMapView ({ identity, profile, sharing, tileStyleUrl, setView, setSh
         }}
       >
         <NavigationArrow size={22} weight='thin' />
-      </button>
+      </button>}
 
       {circles.length === 0 && (
         <div style={s.emptyHint}>
-          You're not in any circles yet. Use the menu above to create one or join via an invite link.
+          {WATCH_ONLY
+            ? 'Not watching any circles yet. Ask someone in a circle for a desktop watcher invite, then use + Join Circle in the menu above.'
+            : "You're not in any circles yet. Use the menu above to create one or join via an invite link."}
         </div>
       )}
+      {WATCH_ONLY && (() => {
+        // Watch-only desktop: say when a circle hasn't added us yet, or
+        // removed us (proposal 2026-10-18-watch-only-client).
+        const pending = circles.filter((c) => c.watchStatus === 'pending').map((c) => c.circle?.name || 'a circle')
+        const removed = circles.filter((c) => c.watchStatus === 'removed').map((c) => c.circle?.name || 'a circle')
+        if (pending.length === 0 && removed.length === 0) return null
+        return (
+          <div style={s.emptyHint}>
+            {pending.length > 0 && <div>Waiting for someone in {pending.join(', ')} to open PearCircle on their phone, which adds this desktop.</div>}
+            {removed.length > 0 && <div style={{ marginTop: pending.length ? 8 : 0 }}>Someone in {removed.join(', ')} removed this desktop, so it no longer gets live locations there.</div>}
+          </div>
+        )
+      })()}
 
       {selectedMember && memberSheetVisible && (
         <MemberDetailSheet
@@ -3350,9 +3374,9 @@ function HomeMapView ({ identity, profile, sharing, tileStyleUrl, setView, setSh
           placesById={placesById}
           isSelf={selectedPubkey === myPubkey}
           connected={connectedPubkeys.has(selectedPubkey)}
-          canRemove={!!ownedCircleForRemoval && selectedPubkey !== myPubkey && selectedPubkey !== singleCircleOwnerKey}
+          canRemove={!WATCH_ONLY && !!ownedCircleForRemoval && selectedPubkey !== myPubkey && selectedPubkey !== singleCircleOwnerKey}
           role={selectedPubkey === singleCircleOwnerKey ? 'Owner' : singleCircleCoowners.has(selectedPubkey) ? 'Co-owner' : null}
-          coownerToggle={coownerToggle ? (coownerToggle.isCoowner ? 'revoke' : 'appoint') : null}
+          coownerToggle={!WATCH_ONLY && coownerToggle ? (coownerToggle.isCoowner ? 'revoke' : 'appoint') : null}
           onCoownerToggle={async () => {
             const r = await pear.call('coowner:set', {
               circleId: coownerToggle.circleId,
@@ -3362,7 +3386,7 @@ function HomeMapView ({ identity, profile, sharing, tileStyleUrl, setView, setSh
             if (!r?.ok) throw new Error(r?.error || 'Could not change co-owner')
           }}
           circleNameForRemoval={ownedCircleForRemoval?.circle?.name ?? circleForHide?.circle?.name ?? 'this circle'}
-          canHide={!!circleForHide}
+          canHide={!WATCH_ONLY && !!circleForHide}
           onHide={async () => {
             const r = await pear.call('member:hide', {
               circleId: circleForHide.circleId,
@@ -5943,6 +5967,7 @@ function ProfileView ({ active = true, profile, sharing, setSharingForCircle, ti
     <div style={s.screen}>
       <BackBar onBack={onClose} title='Settings' />
 
+      {!WATCH_ONLY && (<>
       {/* Avatar header — centered, PearCal pattern. */}
       <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: spacing.md, marginBottom: spacing.xl }}>
         <div style={{
@@ -6023,10 +6048,13 @@ function ProfileView ({ active = true, profile, sharing, setSharingForCircle, ti
 
       {savedAt && <p style={s.muted}>Saved. Members in your circles will see the new profile shortly.</p>}
       {error && <p style={s.error}>{error}</p>}
+      </>)}
 
       <Collapsible title='Circles' icon={UsersThree} open={openSection === 'circles'} onToggle={() => toggleSection('circles')} maxHeight='1200px'>
         <CirclesSection active={active && openSection === 'circles'} onChanged={onSaved} />
       </Collapsible>
+
+      {!WATCH_ONLY && (<>
 
       {/* Sharing: per circle, live location (pause / resume) and, on Android,
           trips. Trip SHARING is hidden on iOS: iOS suspends the app within
@@ -6100,6 +6128,7 @@ function ProfileView ({ active = true, profile, sharing, setSharingForCircle, ti
           <RelaySection subLabel={subLabel} />
         </div>
       </Collapsible>
+      </>)}
 
       <Collapsible title='Display & map' icon={Palette} open={openSection === 'display'} onToggle={() => toggleSection('display')} maxHeight='1600px'>
         <p style={{ ...subLabel, marginTop: 0 }}>Theme</p>
@@ -7967,7 +7996,7 @@ function MemberDetailSheet ({ member, presence, transitions, placesById, isSelf 
           >
             Get directions
           </button>
-          {tripCount > 0 && (
+          {tripCount > 0 && !WATCH_ONLY && (
             <button
               onClick={onOpenTrips}
               style={{
