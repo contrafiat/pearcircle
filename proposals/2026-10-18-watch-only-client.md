@@ -1,6 +1,6 @@
 # Watch-only desktop client
 
-**Status**: Draft 2026-10-18, waiting for Tim's review.
+**Status**: Approved 2026-10-18 by Tim, with open questions 1-3 resolved as proposed: any member can make a watch invite, every member is notified when a watcher is added, and v1 shows positions only (no trips). Question 4 (Linux only for v1) is still open.
 
 **Goal**: A desktop app that joins a circle and shows members on the map, the same as a phone. It never shares a location and does not appear in the member list. Every member can see that a watcher exists in a separate "Watching" list and can remove it.
 
@@ -62,7 +62,7 @@ New pair-channel message `watcherHello { pubkey, label, sig }`, sent by the watc
 
 Watch invites are a new invite flavour: the normal invite plus `role=watch` and a one-time `watchToken`. The inviting phone stores the token locally and only accepts a `watcherHello` that presents it. This stops a normal member invite from being turned into a watcher by anyone who sees the link, and it means a watcher only appears after a member deliberately made a watch invite.
 
-Open question: should a watch invite need the owner, or can any member make one? Proposed: any member, matching how any member can invite today.
+Any member can make a watch invite, matching how any member can invite today (decided 2026-10-18).
 
 ### 3. Phones only send live positions to members and watchers
 
