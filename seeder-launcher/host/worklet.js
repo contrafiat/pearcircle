@@ -43,6 +43,8 @@ class Worklet extends EventEmitter {
     this._proc = spawn(this._barePath, args, {
       stdio: ['pipe', 'pipe', 'pipe'],
       env: { ...process.env },
+      // No console window for bare.exe when the host itself runs windowless.
+      windowsHide: true,
     })
     this._proc.stdout.on('data', (chunk) => this._onStdout(chunk))
     this._proc.stderr.on('data', (chunk) => this._onLog('stderr', chunk.toString()))
