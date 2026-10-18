@@ -4,7 +4,7 @@ import maplibregl from 'maplibre-gl'
 import maplibreCss from 'maplibre-gl/dist/maplibre-gl.css'
 import { colors, colorsRaw, typography, spacing, radius } from './theme.js'
 import { FONT_CSS } from './fonts.js'
-import { Image as ImageIcon, GearSix, Info as InfoIcon, CaretDown, ShareNetwork, PersonSimpleWalk, CarProfile, PencilSimple, Trash, SignOut, BellSimple, BellSimpleSlash, NavigationArrow, AirplaneTilt, ArrowSquareOut, Lightning, CurrencyDollar, BookOpen, EnvelopeSimple, Bug, UsersThree, Palette, Wrench, MapTrifold, Broadcast, ArrowsClockwise, Export as ExportIcon, DownloadSimple, House, Briefcase, GraduationCap, Barbell, Storefront, Church, Tree, FirstAid, ForkKnife, MapPin, CheckCircle, Warning, BatteryWarning, HardDrives } from '@phosphor-icons/react'
+import { Image as ImageIcon, GearSix, Info as InfoIcon, CaretDown, ShareNetwork, PersonSimpleWalk, CarProfile, PencilSimple, Trash, SignOut, BellSimple, BellSimpleSlash, NavigationArrow, AirplaneTilt, ArrowSquareOut, Lightning, CurrencyDollar, BookOpen, EnvelopeSimple, Bug, UsersThree, Palette, Wrench, MapTrifold, Broadcast, ArrowsClockwise, Export as ExportIcon, DownloadSimple, House, Briefcase, GraduationCap, Barbell, Storefront, Church, Tree, FirstAid, ForkKnife, MapPin, CheckCircle, Warning, BatteryWarning, HardDrives, Desktop } from '@phosphor-icons/react'
 import { motionState } from '../lib/motion.js'
 import { MIN_PLACE_RADIUS_M, OS_REGION_MIN_RADIUS_M } from '../lib/geofence.js'
 import { liveStatus } from '../lib/liveStatus.js'
@@ -1495,26 +1495,50 @@ function CreateView ({ onClose, onCreated }) {
 // Sheet for sharing an invite to an existing circle. Fetches the invite
 // link on open via circle:invite (which rebuilds it deterministically
 // from the local joined-record) and renders the same QR/copy/share UI
-// CreateView's result state uses.
+// CreateView's result state uses. The Person / Desktop watcher switch picks a
+// normal invite or a watch invite (proposal 2026-10-18-watch-only-client).
 function InviteShareView ({ circleId, circleName, onClose }) {
   const [invite, setInvite] = useState(null)
   const [error, setError] = useState(null)
+  const [role, setRole] = useState('member')
   useEffect(() => {
     if (!circleId) return
     let cancelled = false
-    callWithTimeout('circle:invite', { circleId })
+    setInvite(null)
+    setError(null)
+    callWithTimeout('circle:invite', { circleId, role })
       .then((r) => { if (!cancelled) setInvite(r?.invite ?? null) })
       .catch((e) => { if (!cancelled) setError(e?.code === 'IPC_TIMEOUT' ? 'Loading the invite is taking too long. Please reopen this sheet.' : String(e?.message ?? e)) })
     return () => { cancelled = true }
-  }, [circleId])
+  }, [circleId, role])
+  const tab = (value, label) => (
+    <button
+      onClick={() => setRole(value)}
+      aria-pressed={role === value}
+      style={{
+        flex: 1, padding: '8px 0', borderRadius: radius.sm,
+        background: role === value ? colors.primary : 'transparent',
+        color: role === value ? colors.text.onPrimary : colors.text.secondary,
+        border: 'none', cursor: 'pointer',
+        fontFamily: typography.fontFamily, fontSize: 14, fontWeight: 400,
+      }}>
+      {label}
+    </button>
+  )
   return (
     <div style={s.screen}>
       <BackBar onBack={onClose} title={circleName ?? 'Invite'} />
+      <div style={{ display: 'flex', gap: 4, padding: 4, marginBottom: spacing.md, borderRadius: radius.md, border: `1px solid ${colors.border}` }}>
+        {tab('member', 'Person')}
+        {tab('watch', 'Desktop watcher')}
+      </div>
       {error && <p style={s.error}>{error}</p>}
       {!error && !invite && <p style={s.muted}>Building invite...</p>}
       {invite && (
         <>
-          <p style={s.muted}>Share the QR code or paste the link to invite someone to this circle.</p>
+          <p style={s.muted}>{role === 'watch'
+            ? 'Open this link in the PearCircle desktop app. It will see everyone on the map but never share a location of its own. Everyone in the circle is told when it joins, and anyone can remove it.'
+            : 'Share the QR code or paste the link to invite someone to this circle.'}</p>
           <QrImage text={invite} />
           <textarea style={s.inviteBox} readOnly value={invite} onFocus={(e) => e.target.select()} />
           <ShareButton text={invite} />
@@ -5030,6 +5054,10 @@ function CirclesSection ({ active = true, onChanged }) {
   // shows a busy label.
   const [notifyingId, setNotifyingId] = useState(null)
   const [notice, setNotice] = useState(null)                 // transient success line
+  // Watch-only desktop pending a Remove confirm (proposal
+  // 2026-10-18-watch-only-client): { circleId, circleName, pubkey, label }.
+  const [removingWatcher, setRemovingWatcher] = useState(null)
+  const [removingWatcherBusy, setRemovingWatcherBusy] = useState(false)
 
   const refresh = useCallback(async () => {
     try {
@@ -5056,6 +5084,9 @@ function CirclesSection ({ active = true, onChanged }) {
           // This circle's members still owe a "we moved" notice (proposal
           // 2026-07-24). Drives the row's Notify members action.
           supersedePending: c.supersedePending === true,
+          // Watch-only desktops, listed apart from members.
+          watchers: Array.isArray(c.watchers) ? c.watchers : [],
+          writable: c.writable === true,
         }))
       setList(next)
     } catch (e) {
@@ -5287,6 +5318,29 @@ function CirclesSection ({ active = true, onChanged }) {
                     Owner tools unlock once everyone has the latest PearCircle. Waiting on {c.waitingOn.join(', ')}.
                   </div>
                 )}
+                {c.watchers.length > 0 && (
+                  <div style={{ marginTop: spacing.xs }}>
+                    <div style={{ ...typography.caption, color: colors.text.secondary }}>Watching</div>
+                    {c.watchers.map((w) => (
+                      <div key={w.pubkey} style={{ display: 'flex', alignItems: 'center', gap: spacing.sm, marginTop: 2 }}>
+                        <Desktop size={14} weight="regular" color={colors.text.secondary} />
+                        <span style={{ ...typography.caption, color: colors.text.primary, flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{w.label}</span>
+                        {c.writable && (
+                          <button
+                            onClick={() => { setError(null); setRemovingWatcher({ circleId: c.circleId, circleName: c.name, pubkey: w.pubkey, label: w.label }) }}
+                            style={{
+                              padding: '2px 10px', borderRadius: radius.sm,
+                              background: 'transparent', color: colors.error,
+                              border: `1px solid ${colors.border}`, cursor: 'pointer',
+                              fontFamily: typography.fontFamily, fontSize: 12, fontWeight: 400,
+                            }}>
+                            Remove
+                          </button>
+                        )}
+                      </div>
+                    ))}
+                  </div>
+                )}
                 {/* The move notice never landed in this circle, so its members
                     have no idea the group moved. The app keeps retrying, but
                     say so plainly and give the owner a lever - a wedged circle
@@ -5392,6 +5446,34 @@ function CirclesSection ({ active = true, onChanged }) {
           />
         )
       })()}
+      {removingWatcher && (
+        <ConfirmSheet
+          title="Remove watcher?"
+          message={<>
+            <strong>{removingWatcher.label}</strong> will stop seeing live locations in <strong>{removingWatcher.circleName}</strong>.
+            <span style={{ display: 'block', marginTop: spacing.sm, color: colors.text.secondary }}>
+              It can still see places and positions saved before now. To lock it out completely, recreate the circle.
+            </span>
+          </>}
+          confirmLabel="Remove"
+          destructive
+          busy={removingWatcherBusy}
+          onConfirm={async () => {
+            setRemovingWatcherBusy(true)
+            try {
+              await pear.call('watcher:remove', { circleId: removingWatcher.circleId, pubkey: removingWatcher.pubkey })
+              setRemovingWatcher(null)
+              await refresh()
+            } catch (e) {
+              setError(String(e?.message ?? e))
+              setRemovingWatcher(null)
+            } finally {
+              setRemovingWatcherBusy(false)
+            }
+          }}
+          onClose={() => { if (!removingWatcherBusy) setRemovingWatcher(null) }}
+        />
+      )}
       {recreatingFor && (
         <ConfirmSheet
           title="Recreate Circle"

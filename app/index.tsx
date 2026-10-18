@@ -406,6 +406,34 @@ async function fireMembershipNotification(payload: any, kind: 'memberJoined' | '
   }
 }
 
+// A watch-only desktop was added to a circle (proposal
+// 2026-10-18-watch-only-client). Every member is told, so nobody can add a
+// watcher without the circle knowing. The worklet owns the freshness and
+// dedup gates; the short-TTL dedup here matches fireMembershipNotification.
+async function fireWatcherAddedNotification(payload: any) {
+  if (!payload || typeof payload.pubkey !== 'string') return
+  const { circleId, pubkey, label, circleName } = payload
+  const name = (typeof label === 'string' && label.length > 0) ? label : 'A desktop'
+  const circle = (typeof circleName === 'string' && circleName.length > 0) ? circleName : 'a circle'
+  const dedupKey = 'watcherAdded:' + pubkey + ':' + (circleId ?? '')
+  const now = Date.now()
+  const lastTs = _recentNotifications.get(dedupKey)
+  if (lastTs != null && now - lastTs < NOTIF_DEDUP_TTL_MS) return
+  _recentNotifications.set(dedupKey, now)
+  try {
+    await Notifications.scheduleNotificationAsync({
+      content: {
+        title: 'PearCircle',
+        body: `${name} is now watching ${circle}`,
+        data: { kind: 'watcherAdded', circleId: circleId ?? null, pubkey },
+      },
+      trigger: Platform.OS === 'android' ? { channelId: 'membership' } : null,
+    })
+  } catch (e: any) {
+    console.warn('fire watcher notification failed: ' + e?.message)
+  }
+}
+
 // A circle member's phone crossed the user's low-battery threshold. Every gate
 // that matters (enabled, threshold, self, freshness, once-per-discharge-cycle)
 // lives in the worklet, which owns the pref and sees the readings from all
@@ -874,6 +902,7 @@ function registerNativeActionHandlers() {
   onEvent('transition:applied', (data) => { fireTransitionNotification(data) })
   onEvent('peerTrip:completed', (data) => { firePeerTripNotification(data) })
   onEvent('member:joined', (data) => { fireMembershipNotification(data, 'memberJoined') })
+  onEvent('watcher:added', (data) => { fireWatcherAddedNotification(data) })
   onEvent('member:left', (data) => { fireMembershipNotification(data, 'memberLeft') })
   onEvent('batteryAlert:low', (data) => { fireBatteryAlertNotification(data) })
   // Keep the local trip-notification-enabled cache fresh so headless trip

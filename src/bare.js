@@ -1342,6 +1342,10 @@ const handlers = {
 
     const parsed = parseInvite(invite)
     if (!parsed.ok) throw new Error('invalid invite: ' + parsed.error)
+    // A watch invite is for the PearCircle desktop app (proposal
+    // 2026-10-18-watch-only-client). Joining it as a phone member would
+    // quietly turn a watcher invite into a full one.
+    if (parsed.role === 'watch' && !_watchMode) throw new Error('This is a watch invite for the PearCircle desktop app. Ask for a normal invite to join from a phone.')
 
     const { circleId, name, circleKey, bootstrap, inviterPublicKey, encryptionKey } = parsed
 
@@ -1708,14 +1712,16 @@ const handlers = {
   // needs (circleId, name, circleKey, bootstrap); the inviter pubkey is
   // ours so peers know who shared it. Used by the existing-circle share
   // flow — no new state, no Hyperbee writes, just a deterministic build.
-  'circle:invite': async ({ circleId } = {}) => {
+  // `role: 'watch'` builds a watch invite for the desktop watcher (proposal
+  // 2026-10-18-watch-only-client).
+  'circle:invite': async ({ circleId, role } = {}) => {
     if (!_initialized) throw new Error('worklet not initialized')
     if (typeof circleId !== 'string') throw new Error('circleId must be a string')
     const record = await _localDb.get('circles:joined:' + circleId)
     if (!record?.value) throw new Error('not a member of that circle')
     const { name, circleKey, bootstrap, encryptionKey } = record.value
     const inviterPublicKey = b4a.toString(_identity.publicKey, 'hex')
-    const invite = buildInvite({ circleId, name, circleKey, bootstrap, encryptionKey, inviterPublicKey })
+    const invite = buildInvite({ circleId, name, circleKey, bootstrap, encryptionKey, inviterPublicKey, role: role === 'watch' ? 'watch' : 'member' })
     return { invite, name }
   },
 
@@ -4389,6 +4395,19 @@ async function readCircleView (circleId, base) {
     }
   }
   supersedes.sort((a, b) => b.postedAt - a.postedAt)
+  // Active watch-only desktops (proposal 2026-10-18-watch-only-client), for
+  // the Watching section. Kept apart from `members`. Oldest first.
+  const watcherRemovedAt = new Map()
+  for await (const { key, value } of view.createReadStream({ gt: 'watcherRemoved:', lt: 'watcherRemoved:~' })) {
+    if (typeof value?.ts === 'number') watcherRemovedAt.set(key.slice('watcherRemoved:'.length), value.ts)
+  }
+  const watchers = []
+  for await (const { key, value } of view.createReadStream({ gt: 'watcher:', lt: 'watcher:~' })) {
+    const pubkey = key.slice('watcher:'.length)
+    if (!watcherActive(value?.ts, watcherRemovedAt.get(pubkey))) continue
+    watchers.push({ pubkey, label: value.label, addedBy: value.addedBy, ts: value.ts })
+  }
+  watchers.sort((a, b) => a.ts - b.ts)
   const result = {
     circle: circleRow ? circleRow.value : null,
     members,
@@ -4397,6 +4416,7 @@ async function readCircleView (circleId, base) {
     places,
     transitions,
     supersedes,
+    watchers,
   }
   // Only cache when no mutation raced our scans; if the gen moved, return this
   // result for the current call but leave the cache empty so the next poll
@@ -4440,6 +4460,7 @@ async function snapshotCircle (circleId, base) {
     places: v.places,
     transitions: v.transitions,
     supersedes: v.supersedes,
+    watchers: v.watchers,
     writable: base.writable,
     writers: base.writers ? base.writers.length : null,
     // True once an append to this circle timed out (wedged local Autobase);
@@ -6145,6 +6166,8 @@ function registerLiveNotify (conn) {
 // The desktop re-sends its hello every few seconds until its row lands, so
 // _watcherHelloInFlight stops us appending the same row more than once.
 const _watcherHelloInFlight = new Set()
+// True when this worklet runs as the watch-only desktop (slice 4 sets it).
+let _watchMode = false
 async function handleWatcherHello (circleId, msg, remotePublicKey) {
   const base = _circleBases.get(circleId)
   if (!base || !base.writable || !_identity) return
