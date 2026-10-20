@@ -18,8 +18,13 @@ runtime and the native addons, so nothing else needs installing.
 
 - **Linux arm64** is cross-built and has not been run on arm64 hardware.
 - **Windows** needs `makensis` (Fedora: `dnf install mingw32-nsis`). The
-  installer is per-user and needs no admin rights. It adds a Start Menu entry,
-  and uninstalling keeps the data folder (`%LOCALAPPDATA%\PearCircle Watcher`).
+  installer asks "just me" (no admin rights, defaults to
+  `%LOCALAPPDATA%\Programs`) or "everyone on this PC" (admin prompt, defaults
+  to Program Files), then lets the user change the folder. It always installs
+  into a `PearCircle Watcher` subfolder of the chosen folder. Silent installs
+  take `/S /CurrentUser` or `/S /AllUsers`, plus `/D=<folder>`. It adds a Start
+  Menu entry, and uninstalling keeps the data folder
+  (`%LOCALAPPDATA%\PearCircle Watcher`).
 - **macOS** stages the app here, then signs, notarizes and builds the .dmg on
   the Mac mini over ssh. `MAC_ARCH=x64` builds for Intel Macs (not tested).
   The app has no Dock icon. Its log is `~/Library/Logs/PearCircle Watcher.log`
