@@ -1137,101 +1137,13 @@ for e in d.get('errors', []) or []:
   UPLOAD_URL=$(printf '%s' "$RELEASE_RESP" \
     | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['upload_url'].split('{')[0])")
 
-  # Build a name -> existing-asset-id map so we can replace assets in
-  # place if the release already had them (re-runs and ZAPSTORE_ONLY
-  # path). Upload-by-name will 422 otherwise.
-  EXISTING_ASSETS_JSON=$(printf '%s' "$RELEASE_RESP" \
-    | python3 -c "
-import sys, json
-d = json.load(sys.stdin)
-print(json.dumps({a['name']: a['id'] for a in d.get('assets', []) or []}))
-" 2>/dev/null || echo "{}")
-
-  # --- Upload the assets, UPLOAD_JOBS (default 4) at a time ---
-  # Usage: _upload_asset <path> <existing-asset-id> <result-prefix>
-  # Writes <result-prefix>.ok on success, or the API response to
-  # <result-prefix>.err on failure.
-  _upload_asset() {
-    local _asset="$1" _existing_id="$2" _out="$3"
-    local _ctype _basename _err
-    _ctype=$(_asset_content_type "$_asset")
-    _basename=$(basename "$_asset")
-    # If an asset with this name already exists on the release, delete it
-    # first so the upload-by-name below doesn't 422 with already_exists.
-    if [ -n "$_existing_id" ]; then
-      echo "==> Replacing existing $_basename (asset id $_existing_id)..."
-      curl -s -X DELETE \
-        -H "Authorization: Bearer $GH_TOKEN" \
-        -H "Accept: application/vnd.github+json" \
-        "https://api.github.com/repos/${REPO_SLUG}/releases/assets/${_existing_id}" \
-        > /dev/null || true
-    fi
-    echo "==> Uploading $_basename ($_ctype)..."
-    if ! curl -sS \
-      -X POST \
-      -H "Authorization: Bearer $GH_TOKEN" \
-      -H "Accept: application/vnd.github+json" \
-      -H "Content-Type: $_ctype" \
-      "${UPLOAD_URL}?name=${_basename}" \
-      --data-binary "@${_asset}" \
-      -o "$_out.resp" 2> "$_out.curl"; then
-      { echo "curl failed:"; cat "$_out.curl"; } > "$_out.err"
-      echo "    FAILED: $_basename"
-      return 1
-    fi
-    _err=$(python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('message',''))" \
-      < "$_out.resp" 2>/dev/null || echo "")
-    if [ -n "$_err" ]; then
-      python3 -m json.tool < "$_out.resp" > "$_out.err" 2>/dev/null || cp "$_out.resp" "$_out.err"
-      echo "    FAILED: $_basename"
-      return 1
-    fi
-    touch "$_out.ok"
-    echo "    Uploaded $_basename."
-  }
-
-  _UPLOAD_JOBS="${UPLOAD_JOBS:-4}"
-  _UP_DIR="$_BG_DIR/uploads"
-  mkdir -p "$_UP_DIR"
-  _up_pids=()
-  echo "==> Uploading ${#RELEASE_ASSETS[@]} assets, up to $_UPLOAD_JOBS at a time..."
-  for _i in "${!RELEASE_ASSETS[@]}"; do
-    # Wait for a free slot.
-    while true; do
-      _running=0
-      for _p in "${_up_pids[@]}"; do
-        if kill -0 "$_p" 2>/dev/null; then _running=$((_running + 1)); fi
-      done
-      [ "$_running" -lt "$_UPLOAD_JOBS" ] && break
-      sleep 1
-    done
-    _existing_id=$(printf '%s' "$EXISTING_ASSETS_JSON" \
-      | python3 -c "
-import sys, json
-m = json.load(sys.stdin)
-print(m.get(sys.argv[1], ''))" "$(basename "${RELEASE_ASSETS[$_i]}")" 2>/dev/null || echo "")
-    _upload_asset "${RELEASE_ASSETS[$_i]}" "$_existing_id" "$_UP_DIR/$_i" < /dev/null &
-    _up_pids+=("$!")
-    _BG_PIDS+=("$!")
-  done
-  for _p in "${_up_pids[@]}"; do wait "$_p" || true; done
-
-  _up_failed=()
-  for _i in "${!RELEASE_ASSETS[@]}"; do
-    [ -e "$_UP_DIR/$_i.ok" ] || _up_failed+=("$_i")
-  done
-  if [ ${#_up_failed[@]} -gt 0 ]; then
-    for _i in "${_up_failed[@]}"; do
-      echo ""
-      echo "ERROR: Upload of $(basename "${RELEASE_ASSETS[$_i]}") failed:"
-      cat "$_UP_DIR/$_i.err" 2>/dev/null || echo "(no response recorded)"
-    done
+  # Several at a time with one progress line (shared library).
+  if ! release_upload_assets "$UPLOAD_URL" "${RELEASE_ASSETS[@]}"; then
     echo ""
-    echo "The GitHub release was created but ${#_up_failed[@]} asset(s) were not attached."
+    echo "ERROR: The GitHub release was created but ${#RELEASE_UPLOAD_FAILED[@]} file(s) were not attached."
     echo "You can upload them manually at: https://github.com/${REPO_SLUG}/releases/tag/${RELEASE_TAG}"
     exit 1
   fi
-  echo "==> All ${#RELEASE_ASSETS[@]} assets uploaded."
 
 else
   # Fallback: gh CLI (requires working auth). gh accepts multiple positional
